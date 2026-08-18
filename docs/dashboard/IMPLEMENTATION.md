@@ -8,59 +8,56 @@ This document is the source of truth for HOW to implement the TUI per DESIGN.md.
 
 ## 1. Scope and relation to DESIGN
 
-- Implements the full final layout from DESIGN.md section 6.
+- Implements the tagged plain-text frame format from DESIGN.md section 6.
 - Fields without a data source render `-` (DESIGN.md section 9).
 - All locked semantics in DESIGN.md section 8.3 are authoritative.
 
 ## 2. Architecture overview
 
-- One dedicated TUI thread owns stdout and the terminal.
-- The engine thread (server_context, single thread) publishes a bounded snapshot under a mutex, throttled to <= 10 Hz.
-- The TUI thread reads the latest snapshot at 1 Hz, re-queries terminal size, lays out, renders a full frame, and flushes.
-- The TUI thread never calls llama APIs directly. All llama-derived values (including the tail string) are pre-computed in the snapshot on the engine thread. This removes any cross-thread llama API question entirely.
-- No stdin handling, no raw mode, no keys. Ctrl-C goes through the existing signal path and kills the server; shutdown restores the terminal.
+- One dedicated printer thread emits one frame per second to stdout. No terminal control, no ncurses, no width/height computation.
+- The engine thread (server_context, single thread) publishes a bounded snapshot under a mutex, throttled to <= 10 Hz. Tails are pre-detokenized on the engine thread (bounded by per-slot `tail_lines`); the printer thread never calls llama APIs.
+- The printer thread also reads the external probes (nvidia-smi, /proc) into `ext_snap`.
+- No stdin handling, no keys. Ctrl-C goes through the existing signal path and kills the server; there is no terminal state to restore.
 
 ```
-engine thread (server_context)                TUI thread
+engine thread (server_context)                 printer thread
   update_slots()  -- every iteration -->
     if (now - last_publish >= 100ms)
-      fill_snapshot(&snap, ctx_server)  (mutex)
-                                            every 1000ms:
-                                              ioctl(TIOCGWINSZ)  -> W,H
-                                              lock, copy snap
-                                              layout(W,H) + render
-                                              flush stdout
-  shutdown: set snap.stop=true (atomic), join thread, restore terminal
+      fill_snapshot(&snap, ctx_server)  (mutex)  every 1000ms:
+      (computes per-slot tail_lines + tails)       read ext probes (nvidia-smi, /proc)
+                                                  lock, copy snap
+                                                  format one N-line frame to stdout
+  shutdown: join thread
 ```
 
 ## 3. Files
 
 New:
 
-- `tools/server/tui.h` - snapshot types, TUI lifecycle API, renderer entry points.
-- `tools/server/tui.cpp` - snapshot fill, TUI thread loop, layout + ANSI renderer.
+- `tools/server/tui.h` - snapshot types, printer lifecycle API, frame formatter entry point.
+- `tools/server/tui.cpp` - printer thread, external probes, frame formatter (plain text).
 
 Modified:
 
-- `tools/server/server-context.cpp/.h` - publish snapshot after `update_slots()` (server-context.cpp:2699); add engine-busy timing around it; expose `llama_get_memory_breakdown()` data, prompt-cache size, and request lifecycle phases.
-- `tools/server/server-task.h` - add `t_arrival_us` to `server_task`.
+- `tools/server/server-context.cpp/.h` - publish snapshot after `update_slots()` (server-context.cpp:2699); engine-busy timing; `llama_get_memory_breakdown()` data; per-slot `tail_lines` allocation + tail detokenization.
+- `tools/server/server-task.h` - `t_arrival_us` on `server_task`.
 - `tools/server/server-queue.cpp` - stamp `t_arrival_us` in `post()` (queue-wait baseline).
-- `tools/server/server.cpp` - `--tui` wiring; start/stop TUI thread around `ctx_server.start_loop()`; terminal restore in `clean_up()` path.
+- `tools/server/server.cpp` - `--tui` wiring; start/stop printer thread around `ctx_server.start_loop()`.
 - `tools/server/server-common.h` - server params field `tui`.
-- `common/arg.cpp`, `common/common.h` - new `--tui` / `--no-tui` flag and env `LLAMA_ARG_TUI`.
+- `common/arg.cpp`, `common/common.h` - `--tui N` flag and env `LLAMA_ARG_TUI`.
 - `tools/server/server-models.cpp:1028` - move the router `LOG(...)` line to stderr so stdout has no other writer.
 - `tools/server/CMakeLists.txt` - add `tui.cpp`.
 
 ## 4. CLI flag
 
-- `--tui` / `--no-tui` (default auto): enabled when `isatty(fileno(stdout))` and not disabled. Router mode: TUI is not applicable (no model context), flag is ignored.
-- Env: `LLAMA_ARG_TUI` (true/false), consistent with other boolean flags (see `common/arg.cpp` and README line 307).
+- `--tui N`: N = total lines per printed frame (exactly), default 0 = off. `--tui 0` / omitted = off (stdout stays empty). Works regardless of TTY (plain text, pipe-safe). Router mode: not applicable, flag is ignored.
+- Env: `LLAMA_ARG_TUI` (int).
 
 ## 5. Logging stream changes
 
 - Today all llama-server logs go to stderr (verified: `common_log_entry::print()` in `common/log.cpp:89-93` sends level != NONE to stderr; INFO/WARN/ERROR/DEBUG all qualify).
 - The only stdout writer is the router-mode `LOG("[%5d] %s", ...)` in `server-models.cpp:1028` (LEVEL_NONE -> stdout). Move it to stderr.
-- Enforce: when TUI is inactive (not a TTY), stdout must remain empty to preserve current behavior for scripts/pipes/systemd.
+- Enforce: when `tui == 0`, stdout must remain empty to preserve current behavior for scripts/pipes/systemd.
 
 ## 6. Snapshot
 
@@ -69,9 +66,10 @@ Fixed-capacity structs preallocated once (no per-tick allocation in the engine t
 ```cpp
 // tools/server/tui.h
 namespace tui {
-constexpr int MAX_SLOTS   = 256;
-constexpr int TAIL_TOKENS = 256;   // tokens copied per slot for tail
-constexpr int TAIL_CHARS  = 4096;  // max rendered chars per tail
+constexpr int MAX_SLOTS      = 256;
+constexpr int TAIL_CHARS     = 8192;  // max chars of tail kept per slot (cap)
+constexpr int TAIL_TOKENS_MIN = 64;   // min tail tokens detokenized per slot
+constexpr int TAIL_TOKENS_MAX = 1024; // max tail tokens detokenized per slot
 
 enum class phase  { idle, prefill, decode };
 enum class kv_loc { none, ram_cache, kv_cpu, kv_gpu, kv_mixed };
@@ -90,13 +88,15 @@ struct slot_snap {
     int32_t   n_remain;
     int64_t   t_last_used;    // us, 0 if never
     int32_t   idle_age_s;     // seconds since last use, -1 if n/a
+    double    queue_ms;       // queue wait for the current task
     double    pp_tps;
     double    tg_tps;
     double    t_prompt_ms;    // pp time (first-token proxy)
     double    t_gen_ms;
     int32_t   id_task;
+    int       tail_lines;     // tail lines to print for this slot (engine-computed)
     char      tail[TAIL_CHARS];
-    bool      tail_valid;
+    int       tail_len;
 };
 
 struct global_snap {
@@ -128,7 +128,6 @@ struct global_snap {
 struct snapshot {
     std::mutex   mtx;
     uint64_t     seq;       // incremented on each publish
-    bool         stop;      // TUI shutdown flag (atomic-ish under mtx)
     global_snap  global;
     slot_snap    slots[MAX_SLOTS];
     int          n_slots;
@@ -179,58 +178,40 @@ Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; lo
 
 ## 8. Terminal handling
 
-- Init (when enabled + TTY):
-  - enter alternate screen `ESC [ ? 1049 h`
-  - hide cursor `ESC [ ? 25 l`
-  - `ESC [ 2 J` clear
-- Per tick: query size via `ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws)` -> W,H. Resize is handled by re-querying every tick (correct by design; SIGWINCH immediate redraw is backlog).
-- Render: build full frame into a buffer, move cursor home `ESC [ H`, write buffer, `fflush(stdout)`.
-- Shutdown (normal exit path / after `start_loop()` returns):
-  - set stop flag, join TUI thread (detached fallback on forced paths), then emit `ESC [ ? 25 h` + `ESC [ ? 1049 l`.
-- The signal handler (`signal_handler` in server.cpp) is unchanged: it calls `shutdown_handler`, which triggers `ctx_server.terminate()` -> `start_loop()` returns -> normal `clean_up()` path. Terminal restore lives in that path, so no signal-unsafe work is needed in the handler.
+None. The printer thread only does `fwrite`/`fflush(stdout)`. No alt-screen, no cursor control, no `ioctl`, no resize handling, no signal-unsafe work. Ctrl-C path is unchanged.
 
-## 9. Rendering and layout
+## 9. Frame format and line budget
 
-### 9.1 Layout algorithm (per tick, given W,H and snapshot)
-
-1. Fixed band: title(1) + status(1) + MEMORY/THROUGHPUT(3) + GPU/SYSTEM(2) = 7 rows. If W < 100, stack panels full-width (total rows grow accordingly; leftover shrinks the SEQUENCES box).
-2. SEQUENCES rows R = H - band - 2 (borders).
-3. Header row: fixed-width columns (see 9.3).
-4. Active slots first: each = summary line + tail box of T rows where T = max(1, (R - 1 - n_idle) / n_active), capped (e.g. 24). All active slots share the space evenly; a single active slot gets nearly the whole box.
-5. Idle slots: one compact line each; if they exceed remaining rows, print as many as fit and append `+N idle`.
-
-### 9.2 Tail window
-
-- Snapshot holds the last `TAIL_CHARS` chars (pre-detokenized on the engine thread).
-- The box renders the most recent `T x (W-4)` characters, word-wrapped. If the text is shorter, pad with blanks. If longer, drop older lines (rolling window), prefixing the first shown line with `...` when truncated.
-
-### 9.3 Per-slot summary columns (fixed widths)
-
-`#  ph  kv(bar)  loc  len      cch   pp/t   tg/t` then tail text (or idle note) filling the rest. Summary line width is fixed so the tail column start is stable; the tail is clipped to available width.
-
-### 9.4 Tail detokenization cost
-
-- On publish (<= 10 Hz) copy last `TAIL_TOKENS` tokens of `generated_tokens` (and `prompt.tokens` during prefill) into a scratch buffer, detokenize once, keep last `TAIL_CHARS` chars.
-- A suffix detokenize may start mid-UTF-8; acceptable for a preview (renderer drops a leading partial code point).
-- This runs on the engine thread but is bounded (256 tokens per active slot, 10 Hz). If profiling shows impact, move to a lower publish rate.
+- The printer builds one frame per second: exactly `N` lines, `N = clamp(tui, 8, 200)`.
+- Lines 1-6 are tagged: `[SERVER] ...`, `[RUN] ...`, `[MEMORY] ...`, `[THROUGHPUT] ...`, `[GPU] ...`, `[SYSTEM] ...`.
+- Then per-slot blocks, then 1 trailing blank line (frame separator).
+- Allocation (matches DESIGN.md section 7):
+  - `content = N - 7` lines available for `[SEQ]` + tails.
+  - `shown = min(n_slots, content)`; `hidden = n_slots - shown`; `note = hidden > 0 ? 1 : 0`; if `shown + note > content`, shrink `shown` to `content - note`.
+  - `tail_budget = content - shown - note`; per-slot `t_i = tail_budget / shown`, and the last `rem = tail_budget % shown` cells get `+1` (the last cell may be longer).
+  - if `hidden > 0`, emit `[SKIP] +K hidden` as the final block line.
+- Each block = `[SEQ n] <summary>` + exactly `t_i` tail lines (blank-padded), so the frame is always exactly `N` lines.
+- `[SEQ n]` summary: `ph loc kv:<bar> len:<used/ctx> cch:<n> pp:<tps> tg:<tps> q:<queue s> dec:<n> rem:<n> t:<task id>`; `-` for n/a.
+- Tail lines = newline-delimited segments of the slot's pre-detokenized `tail` (the last `t_i` of them); no width wrapping (the terminal wraps visually).
 
 ### 9.5 RAM-cache-only detection
 
 - When `--cache-idle-slots` + unified mode clear an idle slot, `prompt_clear()` empties its prompt and KV. The cleared slot has no KV cells and no prompt, so it shows loc `R` (RAM-cached) only if the server can attribute a cache entry to it.
 - v1: if slot is idle, KV empty, and a matching entry exists in `server_prompt_cache`, show `R`; otherwise `-`. Exact attribution (cache entry -> slot) may need a small addition to `server_prompt_cache` (store owning slot id); that is optional/backlog. Simpler v1 fallback: show global `cache` bytes in MEMORY and per-slot `-` for cleared slots.
 
-### 9.6 Units and colors
+### 9.6 Units and formatting
 
 - Bytes: humanized (B, kB, MB, GB); rates: tokens/s, MB/s; latency: ms or s with one decimal.
-- Palette (8-color): title accent, IDL dim, PF yellow, DEC green, KV bar threshold (green <70%, yellow <90%, red >=90%), loc letters G green / C yellow / G/C magenta / R blue / - dim, tail dim, placeholders `-` dim.
-- Values that are not applicable (e.g. tg during prefill) render `-`, not 0.
+- kv bar is `#` (filled) / `.` (empty), 8 wide, by fraction used.
+- Plain text, no colors. Values that are not applicable (e.g. tg during prefill) render `-`, not 0.
 
 ## 10. Concurrency
 
-- Snapshot guarded by `std::mutex`; publish and read both take the lock briefly. Publish copies fixed structs only; no allocation (buffers preallocated, tail scratch reused).
-- TUI thread touches stdout only; engine thread never writes to stdout.
-- Engine-busy instrumentation: two atomics or a small mutex-protected running sum updated in `update_slots()` entry/exit; snapshot reads it. Rolling window (e.g. 5 s) is computed from cumulative counters.
-- No llama API call happens on the TUI thread (all derived values precomputed in the snapshot). This keeps thread-safety trivially correct.
+- Snapshot guarded by `std::mutex`; publish and read both take the lock briefly. Publish copies fixed structs only; no allocation per tick (tail scratch reused).
+- Printer thread writes stdout only; engine thread never writes to stdout.
+- Engine-busy instrumentation: timing accumulation in `update_slots()` entry/exit; rolling 5 s window computed from a small ring.
+- No llama API call happens on the printer thread (all derived values, including tails, are precomputed in the snapshot). This keeps thread-safety trivially correct.
+- The per-slot `tail_lines` and the tail text are both computed on the engine thread in `fill_snapshot`, so the printer just prints what the snapshot says.
 
 ## 11. Build integration
 
@@ -240,11 +221,11 @@ Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; lo
 
 ## 12. Testing / validation
 
-- Non-TTY: run with stdout to a file -> stdout stays empty, TUI absent, behavior unchanged.
-- TTY: run with `--tui`, verify full frame, 1 Hz updates, no flicker, terminal restored on Ctrl-C.
-- Multi-slot: send concurrent completions (2-8 slots), verify phase transitions, tail windows, idle collapse, `busy n/m`, `queue`.
-- Unified vs split: run both, verify kv/len semantics (split per-slot reserved, unified shared occupancy) and loc R vs G behavior.
-- Resize: shrink/grow terminal, verify re-layout on next tick.
+- `--tui` absent or `0`: stdout stays empty, behavior unchanged (piped to file).
+- `--tui N` piped to a file: each frame is exactly N lines (verify with `wc -l` across frames), tags present, blank separator line between frames.
+- Multi-slot: send concurrent completions (2-8 slots), verify `[SEQ n]` blocks, phase transitions, idle notes, `busy n/m`, `queue`, `[SKIP]` when N too small.
+- Unified vs split: run both, verify kv/len semantics (split per-slot reserved, unified shared occupancy) and loc G/C/R/- behavior.
+- Tail: multi-line chat content stays aligned (newline-split), tail lines blank-pad to `t_i`.
 - Cache: repeat a prompt prefix, verify `cch` and `hit%` increase.
 - Spec: run with `-sp`, verify `spec acc`.
 - Memory: verify kv gpu/cpu, weights, cache, rss against a known config; cross-check with `nvidia-smi` and `/proc` when available.
@@ -252,21 +233,21 @@ Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; lo
 
 ## 13. Risks and notes
 
-- The engine thread publishes under a mutex at <= 10 Hz; if profiling shows measurable impact, reduce publish rate or only publish while TUI is active and enabled.
-- `src/llama-ext.h` is a staging header ("try as much as possible to not include in the rest of the codebase"). Using it from the server is acceptable for a personal fork but should be isolated in one place (tui.cpp / server-context), not spread around.
+- The engine thread publishes under a mutex at <= 10 Hz; if profiling shows measurable impact, reduce publish rate.
+- `src/llama-ext.h` is a staging header ("try as much as possible to not include in the rest of the codebase"). Using it from the server is acceptable for a personal fork but should be isolated in one place (server-context), not spread around.
 - The router LOG->stderr change is the only stdout behavior change and only affects router mode.
-- Terminal restore depends on the normal shutdown path; second-Ctrl-C forced exit (server.cpp: signal_handler) will not restore the terminal (acceptable, it is a force-kill path).
+- stdout is a live stream; when `--tui N` is set the server writes N lines/second to stdout, so consumers should pipe to a file or `less`.
 
 ## 14. Implementation checklist
 
-1. Flag `--tui` in common_params + arg + server wiring.
-2. Move router LOG to stderr; verify stdout empty when TUI off.
+1. `--tui N` (int) in common_params + arg + server wiring.
+2. Move router LOG to stderr; verify stdout empty when `tui == 0`.
 3. Snapshot types + publish hook in `update_slots()` (throttled) + engine-busy timing.
-4. TUI thread lifecycle + terminal init/restore + size query + 1 Hz loop.
-5. Renderer: fixed band, SEQUENCES layout, tail window, units/colors, placeholders.
-6. Fill all S1 fields; leave N/B as placeholders.
-7. CMake + build.
-8. Manual validation (section 12).
+4. Printer thread lifecycle + 1 Hz loop (no terminal control).
+5. Frame formatter: tagged lines + N-line budget + per-slot `[SEQ]` + tail lines.
+6. `fill_snapshot`: per-slot `tail_lines` allocation + bounded tail detokenization; fill all S1 fields; N/B placeholders.
+7. External probes (nvidia-smi, /proc) on the printer thread.
+8. CMake + build + manual validation (section 12).
 
 ## Change log
 
@@ -276,3 +257,7 @@ Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; lo
 | 2026-02-14 | Initial implementation: snapshot struct, publish hook, controller, renderer, `--tui` flag, router LOG->stderr, `tui.cpp`/`tui.h`. S1 fields implemented; N/B placeholders. | owner |
 | 2026-02-14 | Tier N (partial): GPU panel via `nvidia-smi` (SM/mem/temp/pwr/clocks, pcie fallback) and SYSTEM panel via `/proc` (process CPU%, disk IO rates), read on the TUI thread into `ext_snap`. | owner |
 | 2026-02-14 | Tier N complete: request lifecycle phases (`req q Xs pp Xs dec Xs`) via `server_task.t_arrival_us` stamped in `server_queue::post()`. | owner |
+| 2026-02-14 | Design change (open questions): always ASCII; tails shown for all sequences in any state; tail window full-width with evenly shared height; tail token budget proportional to window area (TUI writes `tail_tokens_hint` into the snapshot). | owner |
+| 2026-02-14 | Tail box fix: split tail text on newlines, wrap each logical line, sanitize control chars so the box stays aligned with multi-line chat content. | owner |
+| 2026-02-14 | Design change: drop the `...` truncation marker (broke alignment); SEQUENCES uses inline `k:v` summary labels instead of a far-away table header (column header row removed, fixed band now 10 rows). | owner |
+| 2026-02-14 | Major redesign: plain-text timely-output program. `--tui N` = exact lines per frame; tagged lines (`[SERVER]`/`[RUN]`/.../`[SEQ n]`); no terminal control/width/ncurses; per-slot `tail_lines` computed on the engine thread; tail token budget `~ t x 32`; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:`; trailing blank frame separator. | owner |

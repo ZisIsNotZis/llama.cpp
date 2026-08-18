@@ -34,67 +34,58 @@ This document is the source of truth for the TUI feature design. It describes WH
 
 - Runs inside the llama-server process (personal fork; no maintainer approval required, but keep the change clean and reviewable).
 - stdout is reserved for the TUI. All logs stay on stderr (this is already the case today; see IMPLEMENTATION.md).
-- TUI only active when stdout is a TTY and `--tui` is enabled (or auto default). Otherwise stdout stays empty and current behavior is unchanged.
+- TUI is active only when `--tui N` is set (N > 0). Output is plain tagged text, so no TTY check is needed; it works piped or to a file. `--tui 0` / omitted = off and stdout stays empty.
 - No new external dependencies. GPU/CPU/disk data that requires external tools (nvidia-smi, /proc) is sourced by reading them directly; nothing is added to the build.
-- The TUI is at its final version from the start: the full layout always renders. Fields whose data source is not implemented yet show a `-` placeholder.
+- The TUI is at its final version from the start: the full frame always renders. Fields whose data source is not implemented yet show a `-` placeholder.
 
 ## 4. Core principles (locked)
 
-1. Full-screen btop-style layout, auto-maximizing to the current terminal size.
-2. The sequences/tail area owns all space not needed by the compact top band; it resizes with the terminal (re-queried each refresh tick, no signal handler needed for correctness; see backlog for immediate redraw).
-3. One final layout. No "demo version" distinction. Unretrievable fields render `-` and are filled in as data sources land.
-4. Zero input handling. Ctrl-C keeps killing the whole server (existing signal path); the TUI restores the terminal during shutdown.
-5. Engine thread impact must be negligible: snapshot publish is throttled (target <= 10 Hz), TUI repaints at 1 Hz.
+1. The "TUI" is a regular timely-output program: it prints one plain-text frame per second to stdout. No ncurses, no ANSI terminal control, no cursor/alternate-screen, no width/height calculation.
+2. `--tui N` is the total number of lines per frame, printed exactly. Each frame pushes the screen upward, which is what makes it a "TUI" without in-place redraw.
+3. One final frame format. No "demo version" distinction. Unretrievable fields render `-` and are filled in as data sources land.
+4. Zero input handling. Ctrl-C keeps killing the whole server (existing signal path); there is no terminal state to restore.
+5. Engine thread impact must be negligible: snapshot publish is throttled (target <= 10 Hz), printer emits at 1 Hz.
 6. Information density over decoration. Everything shown must carry distinct meaning; duplicates are merged.
 
 ## 5. User experience
 
-- btop-like: a compact top band (identity/status, memory, throughput, GPU, system) plus a dominant SEQUENCES box.
-- Live tail windows per active sequence that auto-wrap and expand to available screen space.
-- Color-coded, read-only, no cursor, no flicker (full frame redraw each tick inside the alternate screen buffer).
-- ASCII-safe fallback for unusual terminals; unicode box drawing preferred (btop look).
+- A live plain-text status stream: every second it prints an exactly-N-line frame and scrolls the terminal upward (watch it directly, or pipe to `less`/a file).
+- Every line is tagged with an uppercase bracket label (`[SERVER]`, `[RUN]`, `[MEMORY]`, `[THROUGHPUT]`, `[GPU]`, `[SYSTEM]`, `[SEQ n]`), so UI lines are instantly distinguishable from raw tail text and are greppable/parseable.
+- Per-sequence blocks: `[SEQ n]` status line (k:v data) followed by its tail lines.
+- Plain ASCII, no colors (pure text is pipe-friendly).
 
-## 6. Screen layout (target)
+## 6. Screen format (target)
 
 ```
-╭─ llama-server ────────────────────────────────────────────────────────────╮
-│ LLaMA 3.2 3B Q8_0  (app)   ctx 32k/128k   split   KV f16/f16   FA  on    │
-│ RUN   busy 3/4   queue 2   engine 78%   ref 1.0s   up 0:31:12            │
-├─ MEMORY ─────────────────────────┬─ THROUGHPUT ──────────────────────────┤
-│ kv gpu 5.1G   kv cpu 0M          │ prompt 312 t/s     gen 45.2 t/s      │
-│ cache 512M    rss 4.2G           │ spec acc 82%       hit 68%           │
-│ used 12.4k/32k cells  39%        │ pp 24ms/t  tg 22ms/t  ftok 1.24s     │
-├─ GPU 0 · RTX 4090 ───────────────┴─ SYSTEM ──────────────────────────────┤
-│ SM 63%  mem 41%  pwr 245W  temp 68C  pclk 1.9G  mclk 1.6G               │
-│ pcie rx 1.2G/s  tx 80M/s         cpu 320%  ioR 45M/s  ioW 1M/s          │
-├─ SEQUENCES · 4 ──────────────────────────────────────────────────────────┤
-│  #  ph   kv       loc  len      cch   pp/t   tg/t                      │
-│  0  PF   ████░░░  G    2048/8192 900  312.4   -                        │
-│  ╭ tail ────────────────────────────────────────────────────────────╮   │
-│  │ Once upon a time in a land far away, there lived a brave knight  │   │
-│  │ who traveled across mountains and rivers to find the legendary   │   │
-│  │ golden sword hidden deep within the enchanted forest...          │   │
-│  ╰──────────────────────────────────────────────────────────────────╯   │
-│  1  DEC  ███████  G    8123/8192  -    -       45.2                  │
-│  ╭ tail ────────────────────────────────────────────────────────────╮   │
-│  │ ...whispers. He met many creatures along the way including       │   │
-│  │ dragons and fairies and wizards who helped him on his noble      │   │
-│  ╰──────────────────────────────────────────────────────────────────╯   │
-│  2  IDL  ███░░░░  G    2048/8192  2048  -       -    idle 12s        │
-│  3  IDL  -        R    -         -     -       -    RAM-cached       │
-╰──────────────────────────────────────────────────────────────────────────╯
+[SERVER] LLaMA 3.2 3B Q8_0 (app)  ctx 32768/128000  split  KV --  FA on  up 0:31h
+[RUN] busy 3/4  queue 2  engine 78%
+[MEMORY] kv gpu 5.1G  kv cpu 0M  weights 3.6G  cache 512M  rss 4.2G  cells 12.4k/32k
+[THROUGHPUT] prompt 312/s  gen 45.2/s  spec 82%  hit 68%  pp 24ms  tg 22ms  ftok 1.24s
+[GPU] SM 63%  mem 41%  pwr 245W  t 68C  pclk 1.9G  mclk 1.6G  pcie 80M/s
+[SYSTEM] cpu 320%  ioR 45M/s  ioW 1M/s  req q 0.3s pp 1.2s dec 8.4s
+[SEQ 0] PF G kv:##...... len:2048/8192 cch:900 pp:312.4 tg:- q:0.3s dec:136 rem:500 t:100
+Once upon a time in a land far away, there lived a brave knight who traveled across mountains and
+rivers to find the legendary golden sword hidden deep within the enchanted forest of whispers.
+[SEQ 1] DEC G kv:######## len:8123/8192 cch:- pp:- tg:45.2 q:- dec:8123 rem:- t:101
+<|im_start|>assistant
+The user has just said "hello". I need to respond in a friendly and helpful manner. It's a common
+[SEQ 2] IDL G kv:##...... len:2048/8192 cch:2048 pp:- tg:- q:- dec:- rem:- t:-
+(idle 12s, KV resident)
+(blank separator line between frames)
 ```
 
-## 7. Layout and resize rules
+## 7. Layout rules (line budget)
 
-- Top band is fixed height (~7 rows): title row, status row, MEMORY|THROUGHPUT (3 rows), GPU|SYSTEM (2 rows).
-- All remaining rows belong to SEQUENCES.
-- SEQUENCES box: 1 header row, then blocks:
-  - active (PF/DEC): summary line + tail box of T rows, T = floor(available / n_active), clamped to [1, cap].
-  - idle: one compact line each, no tail box, listed after active. If they do not fit, drop with a "+N idle" note.
-- Tail window: shows the most recent T x W characters of the sequence, auto-wrapped; scrolls as new tokens arrive.
-- Width: two-column panels when W >= ~100. Narrower terminals stack the top panels full-width (rule in this doc; initial implementation may assume two columns and truncate).
-- Resize: terminal size is re-queried every refresh tick, so resize is reflected on the next tick automatically. Immediate redraw on SIGWINCH is backlog (nice to have).
+- `--tui N`: N is the total number of lines in each printed frame (exactly). Default 0 = off.
+- Frame structure:
+  - 6 fixed tagged lines: `[SERVER]`, `[RUN]`, `[MEMORY]`, `[THROUGHPUT]`, `[GPU]`, `[SYSTEM]`.
+  - one block per sequence, in slot order: `[SEQ n]` status line + `t_n` tail lines.
+  - 1 trailing blank line (frame separator).
+- Tail allocation (coarse): `tail_budget = N - 7 - n_shown`, where `n_shown` = number of `[SEQ]` blocks that fit. Each of the first cells gets `t = tail_budget / n_shown`, and the last cells get `t + 1` for the remainder (the last cell may be longer).
+- If `N` cannot fit all `[SEQ]` lines, show the first that fit and emit `[SKIP] +K hidden` (counted in the budget).
+- Every cell is padded to exactly `t_n` lines (blank lines) so the frame is always exactly N lines.
+- Tail lines are newline-delimited segments of the pre-detokenized tail; no width wrapping (the terminal wraps visually).
+- Tail token budget: `tokens_n ~= t_n x 32` (~100 chars/line, ~4 chars/token), clamped to `[64, 1024]`, computed on the engine side per slot; the snapshot stores each slot's `tail_lines`. No width-based feedback channel.
 
 ## 8. Data model
 
@@ -160,7 +151,7 @@ This document is the source of truth for the TUI feature design. It describes WH
 
 ## 11. Refresh and timing
 
-- TUI repaint: 1 Hz fixed.
+- Printer emits exactly one frame (N lines) per second.
 - Snapshot publish from the engine thread: throttled to <= 10 Hz, bounded size, no allocation per tick (see IMPLEMENTATION.md).
 - No time-based smoothing in v1; per-slot speeds are cumulative for the current task (moving window is backlog).
 
@@ -175,13 +166,17 @@ This document is the source of truth for the TUI feature design. It describes WH
 - KV type getter (public API) -> B.
 - Per-op profiling / eval_callback breakdown -> excluded (not multiseq-safe, out of scope).
 
-## 13. Open questions
+## 13. Open questions (resolved)
 
-- Unicode box drawing vs ASCII fallback in practice (implementation detail, default: unicode with ASCII fallback).
-- Exact tail token window size and whether prompt tail is shown during prefill (default: generated tail always; prompt tail only during prefill).
+- **Box drawing: always ASCII.** No unicode box-drawing or block characters in the TUI output. `+`, `-`, `|` borders; kv bar uses `#` / `.`.
+- **Tail: always shown, for every sequence, in any state** (idle, prefill, decode). Idle slots show the retained prompt/generated tail; cleared idle slots show a short note in the box.
+- **Tail window sizing:** the tail area spans the full width; height is evenly shared across all sequences. Each sequence block = 1 summary line + a tail box of T text rows, T = `(avail_rows / n_slots) - 3` (coarse, remainder distributed to first slots).
+- **Tail token budget:** terminal size + slot count determine the tail window size, which determines how many tail tokens to detokenize per slot: `tokens ≈ (tail_width x T) / 4` (~4 chars/token), clamped to a sane min/max. The TUI thread writes this hint back into the snapshot; the engine thread uses it when building each tail. Coarse approximation is acceptable.
 
 ## Change log
 
 | Date | Change | Approved by |
 |---|---|---|
 | 2026-02-14 | Initial baseline | owner |
+| 2026-02-14 | Open questions resolved: always ASCII; tails always shown for all sequences; tail window full-width, height evenly shared; tail token budget proportional to window area (feedback hint from TUI to engine). | owner |
+| 2026-02-14 | Major redesign: the TUI becomes a plain-text timely-output program. `--tui N` = total lines per frame (exactly N, trailing blank separator); tagged lines (`[SERVER]`, `[RUN]`, ..., `[SEQ n]`); no terminal control / width / height / ncurses; tail lines are newline segments (no wrapping); per-slot `tail_lines` stored in the snapshot, token budget `~ t x 32` per slot; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:` fields. | owner |
