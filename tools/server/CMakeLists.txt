@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-dash.cpp
+    server-dash.h
     tui.cpp
     tui.h
 )

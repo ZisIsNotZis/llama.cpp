@@ -1,109 +1,108 @@
-# llama-server TUI - Design
+# llama-server live monitoring - Overall design
 
 Status: APPROVED BASELINE
 
 Date: 2026-02-14
 
-This document is the source of truth for the TUI feature design. It describes WHAT and WHY, not how to implement it (see IMPLEMENTATION.md).
+This is the overall/source-of-truth design for the live monitoring feature. It defines the shared model and producer used by BOTH consumers:
+
+- the **TUI** (plain-text stdout printer) - detailed design + implementation in IMPLEMENTATION.md
+- the **web dashboard** (SSE tab in the built-in UI) - detailed design + implementation in WEB.md
+
+Any divergence from this design (or the detail docs) requires approval and a doc update first.
 
 ## Document control / change process
 
-- These docs (DESIGN.md + IMPLEMENTATION.md) are the single source of truth for this feature.
+- These docs (DESIGN.md + IMPLEMENTATION.md + WEB.md) are the single source of truth for this feature.
 - Every design or implementation change/compromise requires explicit approval from the owner before any code changes.
 - The order is always: agree on the change -> update the docs -> then change code.
 - Each approved change appends a row to the change log at the end of the affected doc.
 
 ## 1. Goals
 
-- Provide a live, read-only, btop-style dashboard for llama-server shown directly in the terminal running the server.
-- Show all sequences (server slots), both active and idle, with their memory footprint and phase.
-- Show the whole resource picture: model identity, throughput, latency, memory (GPU/CPU/RAM), and, over time, real GPU/CPU/disk utilization.
-- Show the tail of each active sequence as a multi-line auto-wrapping window that grows to fill the terminal.
-- Give a real answer to "is the GPU actually busy and where is the bottleneck" for a running llama-server.
-- Keep the feature opt-in and non-invasive: no behavior change when not enabled or when stdout is not a terminal.
+- Provide a live, read-only view of every sequence (active in a slot, idle, or cached/evicted) plus the whole resource picture: model identity, throughput, latency, memory (GPU/CPU/RAM), and real GPU/CPU/disk utilization.
+- Two surfaces with one shared data source:
+  - a terminal: plain-text, pipe-safe, no terminal control (`--tui N`).
+  - the built-in web UI: a Dashboard tab with full scrollable per-sequence text, live push (no polling), scroll-follow, and cached sequences in a flat list. On by default, no switch.
+- Per-sequence metadata everywhere: created time, last modified, cache hit rate.
+- Keep it non-invasive: no behavior change when the TUI is off, no engine impact.
 
 ## 2. Non-goals
 
-- No interactive input at all: no keys, no mouse, no selection, no configuration inside the TUI.
-- No graphs, sparklines, or historical time-series plots (explicitly excluded).
-- No remote monitoring: the TUI is in-process and only reflects the local server.
-- No exposing model internals beyond what is already reachable; we only surface data llama-server already has or can cheaply compute.
+- No interactive control (no keys in TUI; the web dashboard is read-only for now).
+- No graphs, sparklines, or historical time-series plots.
+- No remote monitoring: both surfaces are in-process and reflect the local server.
+- No exposing model internals beyond what is already reachable or cheaply computable.
+- No long polling for token-speed data (50 tok/s makes it dumb).
 - No changes to inference throughput: the engine thread must not pay meaningful cost.
 
 ## 3. Constraints
 
-- Runs inside the llama-server process (personal fork; no maintainer approval required, but keep the change clean and reviewable).
-- stdout is reserved for the TUI. All logs stay on stderr (this is already the case today; see IMPLEMENTATION.md).
-- TUI is active only when `--tui N` is set (N > 0). Output is plain tagged text, so no TTY check is needed; it works piped or to a file. `--tui 0` / omitted = off and stdout stays empty.
-- No new external dependencies. GPU/CPU/disk data that requires external tools (nvidia-smi, /proc) is sourced by reading them directly; nothing is added to the build.
-- The TUI is at its final version from the start: the full frame always renders. Fields whose data source is not implemented yet show a `-` placeholder.
+- Runs inside the llama-server process (personal fork; keep changes clean and reviewable).
+- TUI: stdout is reserved for it; all logs stay on stderr. Active only when `--tui N` (N > 0); `0`/omitted = off, stdout empty.
+- Web dashboard: part of the built-in web UI. **On by default, no enable/disable switch.**
+- Server-side: no new external dependencies (nvidia-smi, /proc read directly). Frontend may use modern libraries (virtualized lists, etc.).
+- The feature is at its final form from the start; fields without a source render `-`/n/a.
 
 ## 4. Core principles (locked)
 
-1. The "TUI" is a regular timely-output program: it prints one plain-text frame per second to stdout. No ncurses, no ANSI terminal control, no cursor/alternate-screen, no width/height calculation.
-2. `--tui N` is the total number of lines per frame, printed exactly. Each frame pushes the screen upward, which is what makes it a "TUI" without in-place redraw.
-3. One final frame format. No "demo version" distinction. Unretrievable fields render `-` and are filled in as data sources land.
-4. Zero input handling. Ctrl-C keeps killing the whole server (existing signal path); there is no terminal state to restore.
-5. Engine thread impact must be negligible: snapshot publish is throttled (target <= 10 Hz), printer emits at 1 Hz.
-6. Information density over decoration. Everything shown must carry distinct meaning; duplicates are merged.
+1. **Two consumers, one producer**: the stdout printer and the web SSE both read the same per-sequence event stream.
+2. TUI = plain-text timely-output program (no ncurses, no ANSI, no width/height). Web = push-based (SSE), never polling.
+3. Engine impact negligible: status publish throttled (<= 10 Hz); token deltas emitted per decode step (batched).
+4. One final format each. Unretrievable fields render `-` and are filled as sources land.
+5. Zero input handling in the TUI; web dashboard read-only.
+6. Information density over decoration; duplicates are merged.
 
-## 5. User experience
+## 5. Sequence model (shared)
 
-- A live plain-text status stream: every second it prints an exactly-N-line frame and scrolls the terminal upward (watch it directly, or pipe to `less`/a file).
-- Every line is tagged with an uppercase bracket label (`[SERVER]`, `[RUN]`, `[MEMORY]`, `[THROUGHPUT]`, `[GPU]`, `[SYSTEM]`, `[SEQ n]`), so UI lines are instantly distinguishable from raw tail text and are greppable/parseable.
-- Per-sequence blocks: `[SEQ n]` status line (k:v data) followed by its tail lines.
-- Plain ASCII, no colors (pure text is pipe-friendly).
+A **sequence** is the unit shown by both consumers.
 
-## 6. Screen format (target)
+- Identity: a run of one server slot's context. When a slot is reused for an unrelated task (prefix match below `slot_prompt_similarity`, default `0.1`), a NEW sequence is created and the old one becomes cached (if saved) or dies.
+- Lifecycle:
+  - `created` / `active` - growing (new tokens coming).
+  - `idle` - in a slot, KV resident (split mode), not growing.
+  - `evicted` - cleared from the slot, kept in the RAM prompt cache (static text).
+  - `gone` - dropped entirely (cache entry pruned, or never saved).
+- **Created time**: stamped when a run starts and its prefix match is below `slot_prompt_similarity` (or the slot was empty), i.e. "prefix matching failed" -> new context.
+- **Last modified**: last token written (active) / last save or access (evicted).
+- **Cache hit rate (per sequence)**: `n_prompt_cached / (n_prompt_processed + n_prompt_cached)`. It travels with the sequence: saved into the cache entry on eviction, restored on load, cleared when the sequence fully dies.
 
-```
-[SERVER] LLaMA 3.2 3B Q8_0 (app)  ctx 32768/128000  split  KV --  FA on  up 0:31h
-[RUN] busy 3/4  queue 2  engine 78%
-[MEMORY] kv gpu 5.1G  kv cpu 0M  weights 3.6G  cache 512M  rss 4.2G  cells 12.4k/32k
-[THROUGHPUT] prompt 312/s  gen 45.2/s  spec 82%  hit 68%  pp 24ms  tg 22ms  ftok 1.24s
-[GPU] SM 63%  mem 41%  pwr 245W  t 68C  pclk 1.9G  mclk 1.6G  pcie 80M/s
-[SYSTEM] cpu 320%  ioR 45M/s  ioW 1M/s  req q 0.3s pp 1.2s dec 8.4s
-[SEQ 0] PF G kv:##...... len:2048/8192 cch:900 pp:312.4 tg:- q:0.3s dec:136 rem:500 t:100
-Once upon a time in a land far away, there lived a brave knight who traveled across mountains and
-rivers to find the legendary golden sword hidden deep within the enchanted forest of whispers.
-[SEQ 1] DEC G kv:######## len:8123/8192 cch:- pp:- tg:45.2 q:- dec:8123 rem:- t:101
-<|im_start|>assistant
-The user has just said "hello". I need to respond in a friendly and helpful manner. It's a common
-[SEQ 2] IDL G kv:##...... len:2048/8192 cch:2048 pp:- tg:- q:- dec:- rem:- t:-
-(idle 12s, KV resident)
-(blank separator line between frames)
-```
+## 6. Shared event producer
 
-## 7. Layout rules (line budget)
+- Per-sequence **append-only token log** (full text) with a monotonic `seq` (token position / event id).
+- **Events**: text delta (batched per decode step), state change (created, phase, idle, evicted->cache, restored, died), metadata update.
+- The engine thread emits events after each `update_slots()` decode step; status/metadata is also published at <= 10 Hz.
+- **Snapshot coherence** (no token loss between snapshot and first delta): a consumer subscribes to the log first, then reads the snapshot, both under the same mutex; plus per-cell `seq` so a consumer can detect a gap and re-sync a cell.
+- Bounded memory: per-cell ring with a cap; no allocation per event on the hot path.
 
-- `--tui N`: N is the total number of lines in each printed frame (exactly). Default 0 = off.
-- Frame structure:
-  - 6 fixed tagged lines: `[SERVER]`, `[RUN]`, `[MEMORY]`, `[THROUGHPUT]`, `[GPU]`, `[SYSTEM]`.
-  - one block per sequence, in slot order: `[SEQ n]` status line + `t_n` tail lines.
-  - 1 trailing blank line (frame separator).
-- Tail allocation (coarse): `tail_budget = N - 7 - n_shown`, where `n_shown` = number of `[SEQ]` blocks that fit. Each of the first cells gets `t = tail_budget / n_shown`, and the last cells get `t + 1` for the remainder (the last cell may be longer).
-- If `N` cannot fit all `[SEQ]` lines, show the first that fit and emit `[SKIP] +K hidden` (counted in the budget).
-- Every cell is padded to exactly `t_n` lines (blank lines) so the frame is always exactly N lines.
-- Tail lines are newline-delimited segments of the pre-detokenized tail; no width wrapping (the terminal wraps visually).
-- Tail token budget: `tokens_n ~= t_n x 32` (~100 chars/line, ~4 chars/token), clamped to `[64, 1024]`, computed on the engine side per slot; the snapshot stores each slot's `tail_lines`. No width-based feedback channel.
+## 7. Consumers overview
 
-## 8. Data model
+### 7.1 TUI (stdout printer) - see IMPLEMENTATION.md
 
-### 8.1 Global (top band)
+Plain-text frames at 1 Hz, `--tui N` lines per frame, tagged `[SERVER]`/`[SEQ n]` lines, per-slot status + tail lines. Reads the same per-slot data (formatted as a frame).
+
+### 7.2 Web dashboard - see WEB.md
+
+Dashboard tab in the built-in UI, SSE, on by default (no switch). Full scrollable per-cell text with immediate token push, terminal-emulator scroll-follow, HxW grid of active cells, cached sequences in a flat list, per-cell created/modified/hit-rate. Virtualized (lazy) rendering; no "load more" button.
+
+## 8. Data model (shared)
+
+### 8.1 Global
 
 | Field | Meaning |
 |---|---|
 | model desc + alias | what is loaded |
 | ctx / ctx_seq / ctx_train | context configuration |
 | kv mode | unified or split |
-| kv type, flash attention | KV quantization + FA config (placeholder until a source exists) |
+| kv type, flash attention | KV quantization + FA config |
 | status | RUN / SLEEPING (model unloaded) |
 | busy n/m | slots processing / total |
 | queue | deferred tasks waiting for a slot |
-| engine % | fraction of wall time the engine thread spends in update_slots (llama-side utilization) |
-| uptime, refresh | server uptime, refresh interval |
+| engine % | fraction of wall time the engine thread spends in update_slots |
+| uptime | server uptime |
 | prompt/gen tps | global throughput gauges (live window) |
-| spec acc % | speculative decoding acceptance (only when enabled) |
+| req/s | user requests per second (5 s window) |
+| spec acc % | speculative decoding acceptance (when enabled) |
 | cache hit % | prefix-cache hit ratio |
 | pp ms/t, tg ms/t, ftok | per-token latencies and time-to-first-token |
 | kv gpu / kv cpu | KV context memory per backend |
@@ -111,82 +110,59 @@ The user has just said "hello". I need to respond in a friendly and helpful mann
 | cache | prompt/RAM cache bytes and limit |
 | rss | process resident set |
 | used cells | global KV occupancy (unified) or sum (split) |
+| lifetime counters | total prompt/gen/cached/decode since server start |
 
-### 8.2 Per-slot (SEQUENCES)
+### 8.2 Per-sequence
 
 | Field | Meaning |
 |---|---|
-| id | slot id (== llama seq id) |
-| ph | phase: IDL / PF / DEC (idle, prefill, decode) |
-| kv | used/reserved cells + mini bar |
-| loc | where the slot KV lives: G (GPU), C (CPU), G/C (both), R (RAM-cache only), - (none) |
-| len | used/reserved cells (== sequence length for causal models) |
-| cch | cached tokens (prefix cache hits for this task); doubles as prefill progress "PF p/t c:hits" |
-| pp/t, tg/t | prompt / generation speed (tokens/s) |
-| tail | rolling window of latest text |
-| idle info | for idle slots: LRU age, or "RAM-cached" when resident KV was cleared |
+| id | sequence id (== slot id for active, cache-entry id for evicted) |
+| state | active / idle / evicted / gone |
+| phase | IDL / PF / DEC (active or idle only) |
+| loc | G (GPU KV), C (CPU KV), M (mixed), R (RAM cache only), - (none) |
+| kv | used/reserved cells (== sequence length for causal models) |
+| cch | cached tokens (prefix cache hits) |
+| pp/t, tg/t | cumulative prompt / generation speed |
+| pp5/t, tg5/t | sliding-window (~5 s) speeds |
+| created / modified | timestamps (see section 5) |
+| hit rate | per-sequence cache hit rate (see section 5) |
+| text | full sequence text (active: growing; evicted: static) |
 
 ### 8.3 Semantics (locked definitions)
 
 - Phase maps from the server slot state machine: idle, wait-other/started -> PF, processing-prompt -> PF, done-prompt -> PF (final), generating -> DEC.
 - Occupied = slot holds KV cells (seq_pos_max >= 0) regardless of busyness. Active implies occupied; idle may be occupied (split mode, KV resident) or empty.
-- loc is per-slot but KV may span GPU+CPU simultaneously when the model is split across layers; G/C is allowed for mixed.
-- len and kv are the same quantity for causal models (1 token = 1 KV cell); they are merged into one column. No separate length column.
+- len and kv are the same quantity for causal models (1 token = 1 KV cell).
 
-## 9. Data availability tiers and placeholders
+## 9. Data availability tiers
 
-- S1 (available now, in-process): everything in section 8 except GPU/SYSTEM external probes and kv type.
-- N (next, needs external probes or small instrumentation): real GPU component usage (nvidia-smi), CPU%, disk IO, request lifecycle phases (queue -> prefill -> decode).
-- B (backlog): HTTP req/s, cumulative lifetime counters (footer), per-op profiling, immediate resize redraw, KV type getter.
-- Any field without an implemented source renders `-` or `n/a`. The layout never shrinks; only values are placeholder.
+- S1 (in-process, available): everything in section 8 except external probes and a few placeholders.
+- N: real GPU component usage (nvidia-smi), CPU%, disk IO, request lifecycle phases, process RSS - implemented.
+- B (backlog): see section 12.
+- Any field without an implemented source renders `-`/n/a.
 
-## 10. Merging and dedup rules
+## 10. Backlog
 
-- Sequence length == KV used cells for causal models -> one "kv/len" column.
-- Busy state is conveyed by phase per slot; a single "busy n/m" sits in the status row. No per-slot busy column.
-- Cache hits double as prefill progress in the same field.
-- All RAM numbers (rss, cache, kv-on-cpu) live in one MEMORY panel. All GPU/VRAM numbers live in one GPU panel. No KV memory shown in two places.
-- Global gauges + spec + hit rate -> THROUGHPUT. Latency + engine -> SYSTEM.
-- Cumulative lifetime counters are backlog only (potential footer), never in the main view.
+Done (tiers N + B for the TUI): nvidia-smi GPU, /proc CPU/IO, request lifecycle phases, RSS, `[TOTAL]`, KV type, sleep-state publish, req/s, sliding-window speeds, RAM-cache `R` loc, multi-GPU.
 
-## 11. Refresh and timing
+Remaining / web-specific backlog:
 
-- Printer emits exactly one frame (N lines) per second.
-- Snapshot publish from the engine thread: throttled to <= 10 Hz, bounded size, no allocation per tick (see IMPLEMENTATION.md).
-- No time-based smoothing in v1; per-slot speeds are cumulative for the current task (moving window is backlog).
-
-## 12. Backlog
-
-Done / obsolete (not backlog):
-- nvidia-smi GPU, /proc CPU/IO, request lifecycle phases, process RSS -> implemented (tier N).
-- SIGWINCH / resize / terminal re-query -> obsolete (no terminal).
-- Cumulative lifetime counters -> implemented as `[TOTAL]` (tier B).
-- KV type getter -> implemented via `llama_get_kv_cache_types()` (tier B).
-
-Next (tier B remaining):
-- HTTP req/s and stream throughput -> implemented (`[THROUGHPUT] req X/s`; stream bytes approximated by `gen t/s`).
-- Sliding-window per-slot speeds -> implemented (`[SEQ] pp5:/tg5:`).
-- Per-slot RAM-cache (`R`) attribution -> implemented (`server_prompt_cache_state.id_slot`).
-- Multi-GPU / non-NVIDIA support -> multi-GPU implemented (`xN` + summed power); non-NVIDIA still shows `-` (no nvidia-smi).
+- Web: sequence "resume" (later; read-only for now).
+- Web: gap-detection re-sync handler on seq mismatch.
+- Web: mobile/small-screen layout for the HxW grid.
+- Shared: unify the TUI frame formatter and the web event emitter further (both already read the shared producer).
 
 Excluded (documented non-goals):
-- Per-op profiling / eval_callback breakdown (not multiseq-safe, out of scope).
+
+- Per-op profiling / eval_callback breakdown (not multiseq-safe).
 - Interactive control, graphs, remote monitoring.
-
-## 13. Open questions (resolved)
-
-- **Box drawing: always ASCII.** No unicode box-drawing or block characters in the TUI output. `+`, `-`, `|` borders; kv bar uses `#` / `.`.
-- **Tail: always shown, for every sequence, in any state** (idle, prefill, decode). Idle slots show the retained prompt/generated tail; cleared idle slots show a short note in the box.
-- **Tail window sizing:** the tail area spans the full width; height is evenly shared across all sequences. Each sequence block = 1 summary line + a tail box of T text rows, T = `(avail_rows / n_slots) - 3` (coarse, remainder distributed to first slots).
-- **Tail token budget:** terminal size + slot count determine the tail window size, which determines how many tail tokens to detokenize per slot: `tokens ≈ (tail_width x T) / 4` (~4 chars/token), clamped to a sane min/max. The TUI thread writes this hint back into the snapshot; the engine thread uses it when building each tail. Coarse approximation is acceptable.
 
 ## Change log
 
 | Date | Change | Approved by |
 |---|---|---|
-| 2026-02-14 | Initial baseline | owner |
-| 2026-02-14 | Open questions resolved: always ASCII; tails always shown for all sequences; tail window full-width, height evenly shared; tail token budget proportional to window area (feedback hint from TUI to engine). | owner |
-| 2026-02-14 | Major redesign: the TUI becomes a plain-text timely-output program. `--tui N` = total lines per frame (exactly N, trailing blank separator); tagged lines (`[SERVER]`, `[RUN]`, ..., `[SEQ n]`); no terminal control / width / height / ncurses; tail lines are newline segments (no wrapping); per-slot `tail_lines` stored in the snapshot, token budget `~ t x 32` per slot; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:` fields. | owner |
-| 2026-02-14 | Tier B (partial): `[TOTAL]` lifetime counters; `[SERVER]` KV cache types; snapshot publishes on sleep-state change. | owner |
-| 2026-02-14 | Bug fix: single-write frame; boot-time terminal width to estimate per-line visual rows and trim to ~N (no manual wrap). | owner |
-| 2026-02-14 | Tier B complete: `req/s`, sliding-window `pp5:`/`tg5:`, per-slot `R` attribution, multi-GPU `[GPU]`. | owner |
+| 2026-02-14 | Initial baseline (TUI design) | owner |
+| 2026-02-14 | Open questions resolved (TUI): always ASCII; tails for all sequences; even height share; proportional tail token budget. | owner |
+| 2026-02-14 | TUI major redesign: plain-text timely-output program, `--tui N`, tagged lines, no terminal control. | owner |
+| 2026-02-14 | Tier B complete (TUI): `[TOTAL]`, KV type, sleep publish, req/s, pp5/tg5, RAM-cache R, multi-GPU; single-write + width-aware wrap fix. | owner |
+| 2026-02-14 | Restructure into overall design + TUI detail (IMPLEMENTATION.md) + web detail (WEB.md). Add shared sequence model (identity/created/modified/hit-rate), shared event producer, web dashboard consumer (SSE, on by default, no switch). | owner |

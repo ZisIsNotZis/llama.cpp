@@ -1,4 +1,5 @@
-import { Package, Search, Settings, SquarePen } from '@lucide/svelte';
+import { ROUTES } from './routes.constants';
+import { LayoutDashboard, Package, Search, Settings, SquarePen } from '@lucide/svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
 import type { DesktopIconStripItem } from '$lib/types';
 
@@ -61,6 +62,12 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'New chat'
 	},
 	{ icon: Search, keys: ['cmd', 'k'], tooltip: 'Search' },
+	{
+		activeUrlIncludes: '#/dashboard',
+		icon: LayoutDashboard,
+		route: ROUTES.DASHBOARD,
+		tooltip: 'Dashboard'
+	},
 	{
 		action: SidebarAction.SETTINGS,
 		icon: Settings,

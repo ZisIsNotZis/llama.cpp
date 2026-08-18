@@ -8,6 +8,7 @@
 #include "server-stream.h"
 
 #include "tui.h"
+#include "server-dash.h"
 #include "src/llama-ext.h"
 
 #include "build-info.h"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -44,6 +46,12 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// wall-clock epoch microseconds (for dashboard sequence timestamps)
+static int64_t tui_now_epoch_us() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -301,6 +309,11 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // dashboard (shared sequence feed) bookkeeping
+    uint64_t dash_last_tok = 0;  // token count last published to the feed
+    int64_t  dash_t_created = 0; // sequence creation time (epoch us)
+    double   dash_hit_rate  = -1.0; // per-sequence cache hit rate (persists)
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -320,6 +333,9 @@ struct server_slot {
         if (cur == nullptr) {
             return false;
         }
+        cur->t_created  = dash_t_created != 0 ? dash_t_created : tui_now_epoch_us();
+        cur->t_modified = tui_now_epoch_us();
+        cur->hit_rate   = dash_hit_rate;
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
@@ -344,6 +360,11 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        // the context is gone; the next task is a fresh sequence
+        dash_last_tok = 0;
+        dash_t_created = 0;
+        dash_hit_rate = -1.0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -864,6 +885,16 @@ public:
     void start_tui();
     void stop_tui();
 
+    // shared sequence feed (web dashboard, see docs/dashboard/WEB.md)
+    dash::feed & get_dash_feed() {
+        return dash_feed;
+    }
+
+    // status snapshot (global + per-slot), shared with the TUI
+    tui::snapshot & get_tui_snapshot() {
+        return tui_snap;
+    }
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -951,6 +982,9 @@ private:
     tui::snapshot  tui_snap;
     tui::controller tui_ctl { tui_snap };
 
+    // shared sequence feed (web dashboard + TUI)
+    dash::feed dash_feed;
+
     // engine busy tracking (rolling window over update_slots time)
     int64_t engine_busy_us       = 0;
     int64_t engine_ring_t[64]    = {0};
@@ -975,6 +1009,7 @@ private:
     void engine_busy_sample(int64_t dt_us, int64_t t_us);
     double engine_busy_ratio(int64_t now_us);
     void tui_publish();
+    void dash_publish();
 
     void destroy() {
         spec.reset();
@@ -1458,6 +1493,7 @@ private:
             update_slots();
             const int64_t t1 = ggml_time_us();
             engine_busy_sample(t1 - t0, t1);
+            dash_publish();
             tui_publish();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
@@ -4200,6 +4236,14 @@ void server_context::stop_tui() {
     impl->stop_tui();
 }
 
+dash::feed & server_context::get_dash_feed() {
+    return impl->get_dash_feed();
+}
+
+tui::snapshot & server_context::get_tui_snapshot() {
+    return impl->get_tui_snapshot();
+}
+
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
@@ -4691,6 +4735,145 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    // Web dashboard: single SSE stream (see docs/dashboard/WEB.md).
+    // On connect: subscribe -> snapshot (global + per-slot status + all cells),
+    // then stream cell deltas + periodic status refreshes.
+    this->get_dashboard = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "text/event-stream";
+        res->status = 200;
+        res->headers["Cache-Control"] = "no-cache";
+        res->headers["Connection"]    = "keep-alive";
+        res->headers["X-Accel-Buffering"] = "no";
+
+        dash::feed & feed = ctx_server.get_dash_feed();
+        tui::snapshot & snap = ctx_server.get_tui_snapshot();
+        auto cursor_ptr = std::make_shared<uint64_t>(feed.subscribe());
+        auto sent_ptr   = std::make_shared<bool>(false);
+        auto last_status = std::make_shared<int64_t>(0);
+
+        auto global_to_json = [&]() {
+            std::lock_guard<std::mutex> lk(snap.mtx);
+            const tui::global_snap & g = snap.global;
+            return json {
+                {"model", g.model_desc}, {"alias", g.alias},
+                {"ctx", g.n_ctx}, {"ctx_train", g.n_ctx_train}, {"slots", g.n_slots},
+                {"kv_unified", g.kv_unified}, {"flash_attn", g.flash_attn}, {"kv_type", g.kv_type},
+                {"sleeping", g.sleeping}, {"busy", g.busy}, {"deferred", g.deferred},
+                {"engine", g.engine_busy}, {"prompt_tps", g.prompt_tps}, {"gen_tps", g.gen_tps},
+                {"spec_acc", g.spec_acc}, {"hit_rate", g.hit_rate},
+                {"pp_ms", g.pp_ms_tok}, {"tg_ms", g.tg_ms_tok}, {"first_tok", g.first_tok_s},
+                {"req_s", g.req_per_s}, {"requests", g.total_requests},
+                {"req_q", g.req_q_s}, {"req_pp", g.req_pp_s}, {"req_gen", g.req_gen_s},
+                {"kv_gpu", g.kv_gpu_used}, {"kv_cpu", g.kv_cpu_used},
+                {"kv_gpu_res", g.kv_gpu}, {"kv_cpu_res", g.kv_cpu},
+                {"weights_gpu", g.weights_gpu}, {"weights_cpu", g.weights_cpu},
+                {"ram_cache", g.ram_cache}, {"rss", g.rss}, {"uptime", g.uptime_s},
+                {"total_prompt", g.total_prompt}, {"total_gen", g.total_gen},
+                {"total_cached", g.total_cached}, {"total_decode", g.total_decode},
+            };
+        };
+
+        auto slots_to_json = [&]() {
+            std::lock_guard<std::mutex> lk(snap.mtx);
+            json arr = json::array();
+            const char * ph = "IDL";
+            const char * loc = "-";
+            for (int i = 0; i < snap.n_slots; i++) {
+                const tui::slot_snap & s = snap.slots[i];
+                ph = s.ph == tui::phase::prefill ? "PF" : s.ph == tui::phase::decode ? "DEC" : "IDL";
+                loc = s.loc == tui::kv_loc::kv_gpu ? "G" : s.loc == tui::kv_loc::kv_cpu ? "C"
+                    : s.loc == tui::kv_loc::kv_mixed ? "M" : s.loc == tui::kv_loc::ram_cache ? "R" : "-";
+                arr.push_back({
+                    {"id", s.id}, {"phase", ph}, {"loc", loc}, {"occupied", s.occupied},
+                    {"kv_used", s.kv_used}, {"n_ctx", s.n_ctx},
+                    {"n_prompt", s.n_prompt}, {"n_prompt_proc", s.n_prompt_proc},
+                    {"n_prompt_cached", s.n_prompt_cached}, {"n_decoded", s.n_decoded},
+                    {"n_remain", s.n_remain}, {"pp_tps", s.pp_tps}, {"tg_tps", s.tg_tps},
+                    {"pp5", s.pp5_tps}, {"tg5", s.tg5_tps}, {"queue_ms", s.queue_ms},
+                    {"idle_age", s.idle_age_s}, {"task", s.id_task},
+                });
+            }
+            return arr;
+        };
+
+        auto cells_to_json = [](const std::vector<dash::cell> & cells) {
+            json arr = json::array();
+            for (const auto & c : cells) {
+                arr.push_back({
+                    {"id", c.id}, {"active", c.active}, {"evicted", c.evicted},
+                    {"created", c.t_created}, {"modified", c.t_modified}, {"hit", c.hit_rate},
+                    {"seq", c.tseq}, {"text", c.text},
+                });
+            }
+            return arr;
+        };
+
+        res->next = [&feed, &snap, cursor_ptr, sent_ptr, last_status,
+                     global_to_json, slots_to_json, cells_to_json, &req](std::string & output) -> bool {
+            if (req.should_stop()) {
+                return false;
+            }
+            const int64_t now_ms = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (!*sent_ptr) {
+                *sent_ptr = true;
+                *last_status = now_ms;
+                json snap_json = {
+                    {"global", global_to_json()},
+                    {"slots", slots_to_json()},
+                    {"cells", cells_to_json(feed.snapshot())},
+                };
+                output = "event: snapshot\ndata: " + snap_json.dump() + "\n\n";
+                return true;
+            }
+
+            bool resync = false;
+            auto evs = feed.poll(*cursor_ptr, &resync);
+            if (resync) {
+                json snap_json = {
+                    {"global", global_to_json()},
+                    {"slots", slots_to_json()},
+                    {"cells", cells_to_json(feed.snapshot())},
+                };
+                output = "event: snapshot\ndata: " + snap_json.dump() + "\n\n";
+                return true;
+            }
+            if (!evs.empty()) {
+                std::string s;
+                for (const auto & e : evs) {
+                    const char * name = "cell";
+                    switch (e.kind) {
+                        case dash::EV_DELTA:  name = "delta";  break;
+                        case dash::EV_ADD:    name = "add";    break;
+                        case dash::EV_REMOVE: name = "remove"; break;
+                        case dash::EV_CACHE:  name = "cache";  break;
+                        case dash::EV_CELL:   name = "cell";   break;
+                    }
+                    json j = {{"id", e.id}, {"seq", e.tseq}};
+                    if (!e.text.empty()) {
+                        j["text"] = e.text;
+                    }
+                    s += "event: " + std::string(name) + "\ndata: " + j.dump() + "\n\n";
+                }
+                output.swap(s);
+                return true;
+            }
+
+            // periodic status refresh (~1 s): global stats + per-slot status
+            if (now_ms - *last_status >= 1000) {
+                *last_status = now_ms;
+                json st = {{"global", global_to_json()}, {"slots", slots_to_json()}};
+                output = "event: status\ndata: " + st.dump() + "\n\n";
+                return true;
+            }
+
+            feed.wait(std::chrono::milliseconds(400));
+            return true; // keep the connection open
+        };
         return res;
     };
 
@@ -5663,6 +5846,73 @@ void server_context_impl::tui_publish() {
     tui::fill_snapshot(tui_snap, *this);
 }
 
+void server_context_impl::dash_publish() {
+    if (!ctx_tgt) {
+        return;
+    }
+    // status snapshot (global + per-slot), ~5 Hz, regardless of --tui
+    {
+        const int64_t t = ggml_time_us();
+        if (t - tui_last_publish_us >= 200 * 1000) {
+            tui_last_publish_us = t;
+            tui::fill_snapshot(tui_snap, *this);
+        }
+    }
+    const int64_t now = tui_now_epoch_us();
+    dash_feed.begin();
+    for (auto & slot : slots) {
+        const size_t cur = slot.prompt.n_tokens();
+        if (cur == 0) {
+            continue;
+        }
+        std::string full, delta;
+        if (slot.dash_last_tok == 0 || cur < slot.dash_last_tok) {
+            full = common_detokenize(ctx_tgt, slot.prompt.tokens.get_tokens(), true);
+        } else if (cur > slot.dash_last_tok) {
+            const llama_tokens & toks = slot.prompt.tokens.get_tokens();
+            if (slot.dash_last_tok < toks.size()) {
+                llama_tokens suffix(toks.begin() + slot.dash_last_tok, toks.end());
+                delta = common_detokenize(ctx_tgt, suffix, true);
+            }
+        }
+        if (slot.dash_t_created == 0) {
+            slot.dash_t_created = now;
+        }
+        const uint64_t total = slot.stats.n_prompt_processed + slot.stats.n_prompt_cached;
+        if (total > 0) {
+            slot.dash_hit_rate = (double) slot.stats.n_prompt_cached / (double) total;
+        }
+        dash_feed.update_active(slot.id, slot.is_processing(), slot.dash_t_created, now,
+                                slot.dash_hit_rate, (uint64_t) cur, full, delta);
+        slot.dash_last_tok = cur;
+    }
+    if (prompt_cache) {
+        for (const auto & st : prompt_cache->states) {
+            const int sid = st.id_slot;
+            if (sid < 0) {
+                continue;
+            }
+            bool slot_active = false;
+            for (auto & slot : slots) {
+                if (slot.id == sid && slot.prompt.n_tokens() > 0) {
+                    slot_active = true;
+                    break;
+                }
+            }
+            if (slot_active) {
+                continue;
+            }
+            std::string text;
+            if (!dash_feed.has_cell(sid)) {
+                text = common_detokenize(ctx_tgt, st.prompt.tokens.get_tokens(), true);
+            }
+            dash_feed.update_evicted(sid, st.t_created, st.t_modified, st.hit_rate,
+                                     (uint64_t) st.prompt.tokens.get_tokens().size(), text);
+        }
+    }
+    dash_feed.end();
+}
+
 void server_context_impl::start_tui() {
     if (params_base.tui > 0) {
         tui_ctl.start(params_base.tui);
@@ -5731,6 +5981,29 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
                 g.compute_gpu += data.compute;
             }
         }
+    }
+
+    // used KV bytes = reserved x (used cells / reserved cells)
+    {
+        uint64_t used_cells = 0;
+        uint64_t resv_cells = 0;
+        for (const auto & s : ctx.slots) {
+            if (!ctx.ctx_tgt) {
+                break;
+            }
+            const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(ctx.ctx_tgt), s.id);
+            if (pmax >= 0) {
+                used_cells += (uint64_t) (pmax + 1);
+            }
+            if (ctx.params_base.kv_unified) {
+                resv_cells = llama_n_ctx(ctx.ctx_tgt);
+            } else {
+                resv_cells += (uint64_t) std::max(0, s.n_ctx);
+            }
+        }
+        const double frac = resv_cells > 0 ? (double) used_cells / (double) resv_cells : 0.0;
+        g.kv_gpu_used = (size_t) ((double) g.kv_gpu * frac);
+        g.kv_cpu_used = (size_t) ((double) g.kv_cpu * frac);
     }
 
     if (ctx.prompt_cache) {
