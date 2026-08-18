@@ -17,6 +17,19 @@
 #define RES_ERR(fmt, ...) LOG_ERR("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define RES_DBG(fmt, ...) LOG_DBG("res  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 
+// user-facing request types (internal/control tasks are not counted)
+static bool is_user_task(server_task_type type) {
+    switch (type) {
+        case SERVER_TASK_TYPE_COMPLETION:
+        case SERVER_TASK_TYPE_EMBEDDING:
+        case SERVER_TASK_TYPE_RERANK:
+        case SERVER_TASK_TYPE_INFILL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 //
 // server_queue
 //
@@ -29,6 +42,9 @@ int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
     task.t_arrival_us = ggml_time_us();
+    if (is_user_task(task.type)) {
+        n_requests++;
+    }
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -56,6 +72,9 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             task.id = id++;
         }
         task.t_arrival_us = ggml_time_us();
+        if (is_user_task(task.type)) {
+            n_requests++;
+        }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);

@@ -316,7 +316,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, id);
         if (cur == nullptr) {
             return false;
         }
@@ -959,6 +959,19 @@ private:
     int     engine_ring_n        = 0;
     int64_t tui_last_publish_us  = 0;
 
+    // TUI request-rate ring
+    int64_t  req_ring_t[64]      = {0};
+    uint64_t req_ring_n[64]      = {0};
+    int      req_ring_head       = 0;
+    int      req_ring_n_samples  = 0;
+
+    // TUI per-slot sliding-window speed history (32 samples each)
+    int64_t  slot_hist_t[tui::MAX_SLOTS][32]   = {{0}};
+    int32_t  slot_hist_pp[tui::MAX_SLOTS][32]  = {{0}};
+    int32_t  slot_hist_dec[tui::MAX_SLOTS][32] = {{0}};
+    int      slot_hist_head[tui::MAX_SLOTS]    = {0};
+    int      slot_hist_n[tui::MAX_SLOTS]       = {0};
+
     void engine_busy_sample(int64_t dt_us, int64_t t_us);
     double engine_busy_ratio(int64_t now_us);
     void tui_publish();
@@ -995,6 +1008,10 @@ private:
             }
         }
         sleeping = new_state;
+        // publish immediately (bypass the 10 Hz throttle) so the frame shows SLEEP/RUN
+        if (tui_ctl.is_active()) {
+            tui::fill_snapshot(tui_snap, *this);
+        }
     }
 
     struct load_progress_data {
@@ -5661,6 +5678,12 @@ namespace tui {
 void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     global_snap g;
 
+    // carry over the previous frame (e.g. model info stays visible while sleeping)
+    {
+        std::lock_guard<std::mutex> lk(snap.mtx);
+        g = snap.global;
+    }
+
     if (ctx.model_tgt) {
         char buf[256];
         llama_model_desc(ctx.model_tgt, buf, sizeof(buf));
@@ -5676,10 +5699,24 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     g.n_slots     = (uint32_t) ctx.slots.size();
     g.kv_unified  = ctx.params_base.kv_unified;
     snprintf(g.flash_attn, sizeof(g.flash_attn), "%s", llama_flash_attn_type_name(ctx.params_base.flash_attn_type));
+    if (ctx.ctx_tgt) {
+        ggml_type type_k = GGML_TYPE_F16;
+        ggml_type type_v = GGML_TYPE_F16;
+        llama_get_kv_cache_types(ctx.ctx_tgt, &type_k, &type_v);
+        snprintf(g.kv_type, sizeof(g.kv_type), "%s/%s", ggml_type_name(type_k), ggml_type_name(type_v));
+    } else if (g.kv_type[0] == '\0') {
+        snprintf(g.kv_type, sizeof(g.kv_type), "%s", "--");
+    }
     g.speculative = ctx.spec != nullptr;
     g.sleeping    = ctx.sleeping;
     g.deferred    = ctx.queue_tasks.queue_tasks_deferred_size();
     g.busy        = 0;
+
+    // cumulative lifetime counters
+    g.total_prompt = ctx.metrics.prompt.count;
+    g.total_gen    = ctx.metrics.predict.count;
+    g.total_cached = ctx.metrics.n_prompt_cached;
+    g.total_decode = ctx.metrics.n_decode;
 
     // memory breakdown per backend (model / context / compute)
     if (ctx.ctx_tgt) {
@@ -5723,6 +5760,37 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         g.tg_ms_tok = (double) ctx.metrics.predict.time / (double) ctx.metrics.predict.count / 1000.0;
     }
     g.engine_busy = ctx.engine_busy_ratio(ggml_time_us());
+
+    // request rate over a 5 s window
+    {
+        const uint64_t nreq = ctx.queue_tasks.n_requests;
+        const int64_t now = ggml_time_us();
+        g.total_requests = nreq;
+        ctx.req_ring_t[ctx.req_ring_head] = now;
+        ctx.req_ring_n[ctx.req_ring_head] = nreq;
+        ctx.req_ring_head = (ctx.req_ring_head + 1) % 64;
+        if (ctx.req_ring_n_samples < 64) {
+            ctx.req_ring_n_samples++;
+        }
+        int64_t base_t = 0;
+        uint64_t base_n = 0;
+        const int64_t want = now - 5 * 1000 * 1000;
+        for (int i = 0; i < ctx.req_ring_n_samples; i++) {
+            const int idx = (ctx.req_ring_head - 1 - i + 64) % 64;
+            if (ctx.req_ring_t[idx] <= want) {
+                base_t = ctx.req_ring_t[idx];
+                base_n = ctx.req_ring_n[idx];
+                break;
+            }
+        }
+        if (base_t == 0 && ctx.req_ring_n_samples > 0) {
+            const int idx = (ctx.req_ring_head - 1 + 64) % 64;
+            base_t = ctx.req_ring_t[idx];
+            base_n = ctx.req_ring_n[idx];
+        }
+        const double dt = base_t > 0 ? (now - base_t) / 1e6 : 0.0;
+        g.req_per_s = dt > 0 ? (nreq - base_n) / dt : 0.0;
+    }
 
     // frame layout: per-slot tail line allocation (--tui N)
     const int n_slots = (int) std::min(ctx.slots.size(), (size_t) MAX_SLOTS);
@@ -5785,6 +5853,10 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
                                       : kv_loc::none;
         } else {
             d.loc = kv_loc::none;
+            // idle slot whose KV was cleared but a RAM-cache copy exists
+            if (ctx.prompt_cache && ctx.prompt_cache->has_state_for(s.id)) {
+                d.loc = kv_loc::ram_cache;
+            }
         }
 
         d.n_prompt        = s.task ? (int32_t) s.task->n_tokens() : (int32_t) s.prompt.n_tokens();
@@ -5801,6 +5873,45 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         d.tg_tps          = s.stats.n_gen_tps();
         d.t_prompt_ms     = s.stats.t_prompt_ms();
         d.t_gen_ms        = s.stats.t_gen_ms();
+
+        // sliding-window (~5 s) speeds from a per-slot sample ring
+        {
+            const int sid = s.id;
+            const int64_t now = ggml_time_us();
+            const int h = ctx.slot_hist_head[sid];
+            const int ns = ctx.slot_hist_n[sid];
+            d.pp5_tps = 0.0;
+            d.tg5_tps = 0.0;
+            if (ns > 0) {
+                const int64_t want = now - 5 * 1000 * 1000;
+                int64_t base_t = 0;
+                int32_t base_pp = 0;
+                int32_t base_dec = 0;
+                for (int k = 0; k < ns && k < 32; k++) {
+                    const int idx = (h - 1 - k + 32) % 32;
+                    if (ctx.slot_hist_t[sid][idx] <= want) {
+                        base_t   = ctx.slot_hist_t[sid][idx];
+                        base_pp  = ctx.slot_hist_pp[sid][idx];
+                        base_dec = ctx.slot_hist_dec[sid][idx];
+                        break;
+                    }
+                }
+                if (base_t > 0 && now > base_t) {
+                    const double dt = (now - base_t) / 1e6;
+                    const int dp = (int32_t) s.stats.n_prompt_processed - base_pp;
+                    const int dg = (int32_t) s.stats.n_gen - base_dec;
+                    d.pp5_tps = dp > 0 && dt > 0 ? dp / dt : 0.0;
+                    d.tg5_tps = dg > 0 && dt > 0 ? dg / dt : 0.0;
+                }
+            }
+            ctx.slot_hist_t[sid][h]   = now;
+            ctx.slot_hist_pp[sid][h]  = (int32_t) s.stats.n_prompt_processed;
+            ctx.slot_hist_dec[sid][h] = (int32_t) s.stats.n_gen;
+            ctx.slot_hist_head[sid] = (h + 1) % 32;
+            if (ctx.slot_hist_n[sid] < 32) {
+                ctx.slot_hist_n[sid]++;
+            }
+        }
 
         d.tail_lines = alloc.per_slot[i];
 

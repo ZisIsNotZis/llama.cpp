@@ -157,14 +157,21 @@ The user has just said "hello". I need to respond in a friendly and helpful mann
 
 ## 12. Backlog
 
-- Immediate redraw on SIGWINCH (correctness already handled by per-tick re-query).
-- nvidia-smi one-shot integration (GPU SM/mem/temp/power/clocks/PCIe) -> N.
-- /proc integration (CPU%, disk IO rates, process RSS on Linux) -> N.
-- Request lifecycle phases with queue-wait timing -> N.
-- HTTP req/s and stream throughput -> B.
-- Cumulative lifetime counters (footer) -> B.
-- KV type getter (public API) -> B.
-- Per-op profiling / eval_callback breakdown -> excluded (not multiseq-safe, out of scope).
+Done / obsolete (not backlog):
+- nvidia-smi GPU, /proc CPU/IO, request lifecycle phases, process RSS -> implemented (tier N).
+- SIGWINCH / resize / terminal re-query -> obsolete (no terminal).
+- Cumulative lifetime counters -> implemented as `[TOTAL]` (tier B).
+- KV type getter -> implemented via `llama_get_kv_cache_types()` (tier B).
+
+Next (tier B remaining):
+- HTTP req/s and stream throughput -> implemented (`[THROUGHPUT] req X/s`; stream bytes approximated by `gen t/s`).
+- Sliding-window per-slot speeds -> implemented (`[SEQ] pp5:/tg5:`).
+- Per-slot RAM-cache (`R`) attribution -> implemented (`server_prompt_cache_state.id_slot`).
+- Multi-GPU / non-NVIDIA support -> multi-GPU implemented (`xN` + summed power); non-NVIDIA still shows `-` (no nvidia-smi).
+
+Excluded (documented non-goals):
+- Per-op profiling / eval_callback breakdown (not multiseq-safe, out of scope).
+- Interactive control, graphs, remote monitoring.
 
 ## 13. Open questions (resolved)
 
@@ -180,3 +187,6 @@ The user has just said "hello". I need to respond in a friendly and helpful mann
 | 2026-02-14 | Initial baseline | owner |
 | 2026-02-14 | Open questions resolved: always ASCII; tails always shown for all sequences; tail window full-width, height evenly shared; tail token budget proportional to window area (feedback hint from TUI to engine). | owner |
 | 2026-02-14 | Major redesign: the TUI becomes a plain-text timely-output program. `--tui N` = total lines per frame (exactly N, trailing blank separator); tagged lines (`[SERVER]`, `[RUN]`, ..., `[SEQ n]`); no terminal control / width / height / ncurses; tail lines are newline segments (no wrapping); per-slot `tail_lines` stored in the snapshot, token budget `~ t x 32` per slot; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:` fields. | owner |
+| 2026-02-14 | Tier B (partial): `[TOTAL]` lifetime counters; `[SERVER]` KV cache types; snapshot publishes on sleep-state change. | owner |
+| 2026-02-14 | Bug fix: single-write frame; boot-time terminal width to estimate per-line visual rows and trim to ~N (no manual wrap). | owner |
+| 2026-02-14 | Tier B complete: `req/s`, sliding-window `pp5:`/`tg5:`, per-slot `R` attribution, multi-GPU `[GPU]`. | owner |

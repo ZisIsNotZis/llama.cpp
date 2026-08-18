@@ -600,6 +600,7 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    int id_slot = -1; // owning slot (for the TUI RAM-cache loc), -1 = unknown
 
     size_t size() const {
         size_t res = data.size();
@@ -630,9 +631,11 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, int id_slot);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    bool has_state_for(int id_slot) const;
 
     void update();
 };

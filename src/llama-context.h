@@ -60,6 +60,9 @@ struct llama_context {
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
+    ggml_type get_kv_type_k() const { return kv_type_k; }
+    ggml_type get_kv_type_v() const { return kv_type_v; }
+
     ggml_backend_sched_t get_sched() const;
 
     uint32_t n_ctx()     const;
@@ -280,6 +283,10 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // KV cache data types (from llama_context_params, for diagnostics)
+    ggml_type kv_type_k = GGML_TYPE_F16;
+    ggml_type kv_type_v = GGML_TYPE_F16;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

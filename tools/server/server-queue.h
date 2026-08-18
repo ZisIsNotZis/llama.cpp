@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -108,6 +109,9 @@ public:
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return queue_tasks_deferred.size();
     }
+
+    // cumulative number of user-facing requests enqueued (for the TUI req/s)
+    std::atomic<uint64_t> n_requests{0};
 
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called

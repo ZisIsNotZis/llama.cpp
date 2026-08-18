@@ -11,6 +11,7 @@
 #include <vector>
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <sys/ioctl.h>
 #include <unistd.h>
 #endif
 
@@ -47,7 +48,23 @@ static std::string fint(long long v) {
 
 // defined later in this file
 std::vector<std::string> format_frame(const global_snap & g, const std::vector<slot_snap> & slots,
-                                      const ext_snap & ext, int N);
+                                      const ext_snap & ext);
+
+// display columns of a plain-text line (utf-8 aware; no ANSI in output)
+static size_t u8cols(const std::string & s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char b = (unsigned char) s[i];
+        size_t l = 1;
+        if      (b >= 0xF0) l = 4;
+        else if (b >= 0xE0) l = 3;
+        else if (b >= 0xC0) l = 2;
+        if (i + l > s.size()) l = s.size() - i;
+        i += l;
+        n++;
+    }
+    return n;
+}
 
 // ---------------------------------------------------------------------------
 // tail text helpers (no width math: lines are newline-delimited segments)
@@ -100,19 +117,39 @@ static std::vector<std::string> split_lines(const std::string & s) {
 // ---------------------------------------------------------------------------
 
 #if defined(__linux__)
-static bool nvidia_smi_probe(int & sm, int & mem, int & temp, double & pwr, double & pclk, double & mclk) {
+static bool nvidia_smi_probe(int & sm, int & mem, int & temp, double & pwr, double & pclk, double & mclk, int & n_gpu) {
     FILE * p = popen("nvidia-smi --query-gpu=utilization.gpu,utilization.memory,temperature.gpu,power.draw,"
                      "clocks.sm,clocks.mem --format=csv,noheader,nounits 2>/dev/null", "r");
     if (!p) {
         return false;
     }
     char line[512];
-    bool ok = fgets(line, sizeof(line), p) != nullptr;
+    int count = 0;
+    double pwr_sum = 0.0;
+    bool first = true;
+    while (fgets(line, sizeof(line), p)) {
+        int s = 0, m = 0, t = 0;
+        double pw = 0, pc = 0, mc = 0;
+        if (sscanf(line, "%d,%d,%d,%lf,%lf,%lf", &s, &m, &t, &pw, &pc, &mc) == 6) {
+            if (first) {
+                sm = s;
+                mem = m;
+                temp = t;
+                pclk = pc;
+                mclk = mc;
+                first = false;
+            }
+            pwr_sum += pw;
+            count++;
+        }
+    }
     pclose(p);
-    if (!ok) {
+    if (count == 0) {
         return false;
     }
-    return sscanf(line, "%d,%d,%d,%lf,%lf,%lf", &sm, &mem, &temp, &pwr, &pclk, &mclk) == 6;
+    pwr = pwr_sum;
+    n_gpu = count;
+    return true;
 }
 
 // pcie counters are not supported on all drivers; tolerate failure
@@ -175,8 +212,10 @@ void controller::read_ext() {
 #if defined(__linux__)
     int sm = 0, mem = 0, temp = 0;
     double pwr = 0, pclk = 0, mclk = 0;
-    if (nvidia_smi_probe(sm, mem, temp, pwr, pclk, mclk)) {
+    int n_gpu = 0;
+    if (nvidia_smi_probe(sm, mem, temp, pwr, pclk, mclk, n_gpu)) {
         ext_.gpu_avail = true;
+        ext_.gpu_count = n_gpu;
         ext_.gpu_sm   = sm;
         ext_.gpu_mem  = mem;
         ext_.gpu_temp = temp;
@@ -185,6 +224,7 @@ void controller::read_ext() {
         ext_.gpu_mclk = mclk;
     } else {
         ext_.gpu_avail = false;
+        ext_.gpu_count = 0;
     }
 
     unsigned long long rx = 0, tx = 0;
@@ -267,6 +307,15 @@ void controller::run() {
     while (running_) {
         read_ext();
 
+        // terminal width; 0 when not a tty (no visual budget, full frame)
+        int W = 0;
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+        struct winsize ws;
+        if (isatty(fileno(stdout)) && ioctl(fileno(stdout), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+            W = (int) ws.ws_col;
+        }
+#endif
+
         global_snap g;
         std::vector<slot_snap> slots;
         {
@@ -276,11 +325,28 @@ void controller::run() {
             slots.assign(snap_.slots, snap_.slots + n);
         }
 
-        std::vector<std::string> frame = format_frame(g, slots, ext_, n_lines_);
-        for (const auto & ln : frame) {
-            fwrite(ln.data(), 1, ln.size(), stdout);
-            fputc('\n', stdout);
+        const std::vector<std::string> lines = format_frame(g, slots, ext_);
+
+        // emit one concatenated string; estimate per-line terminal rows from
+        // the terminal width (lines wrap visually, so count ceil(cols/W)) and
+        // trim to ~N rows (always keep the 7 fixed tagged lines)
+        std::string out;
+        int visual = 0;
+        const int N = std::max(FRAME_MIN, std::min(n_lines_, FRAME_MAX));
+        for (int i = 0; i < (int) lines.size(); i++) {
+            int h = 1;
+            if (W > 0) {
+                h = std::max(1, (int) ((u8cols(lines[i]) + (size_t) W - 1) / (size_t) W));
+            }
+            if (i >= 7 && W > 0 && visual + h > N) {
+                break;
+            }
+            out += lines[i];
+            out += '\n';
+            visual += h;
         }
+
+        fwrite(out.data(), 1, out.size(), stdout);
         fflush(stdout);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -296,7 +362,7 @@ tail_alloc_t tail_alloc(int N, int n_slots) {
     N = std::max(FRAME_MIN, std::min(N, FRAME_MAX));
     tail_alloc_t r;
     r.per_slot.assign((size_t) std::max(0, n_slots), 0);
-    const int content = N - 7; // lines for [SEQ] + tails (trailing blank reserved)
+    const int content = N - FRAME_FIXED; // lines for [SEQ] + tails (fixed lines reserved)
     int shown  = std::min(n_slots, content);
     int hidden = n_slots - shown;
     int note   = hidden > 0 ? 1 : 0;
@@ -349,6 +415,8 @@ static std::string seq_line(const slot_snap & s) {
     std::string cch = s.n_prompt_cached > 0 ? std::to_string(s.n_prompt_cached) : "-";
     std::string pp  = s.pp_tps > 0.0 ? fstr(s.pp_tps, 1) : "-";
     std::string tg  = s.tg_tps > 0.0 ? fstr(s.tg_tps, 1) : "-";
+    std::string pp5 = s.pp5_tps > 0.0 ? fstr(s.pp5_tps, 1) : "-";
+    std::string tg5 = s.tg5_tps > 0.0 ? fstr(s.tg5_tps, 1) : "-";
     std::string q   = s.queue_ms > 0.0 ? fstr(s.queue_ms / 1000.0, 1) : "-";
     std::string dec = s.n_decoded > 0 ? std::to_string(s.n_decoded) : "-";
     std::string rem = s.n_remain >= 0 ? std::to_string(s.n_remain) : "-";
@@ -356,7 +424,8 @@ static std::string seq_line(const slot_snap & s) {
 
     return "[SEQ " + std::to_string(s.id) + "] " + ph_str(s.ph) + " " + loc_str(s.loc)
          + " kv:" + bar + " len:" + len + " cch:" + cch
-         + " pp:" + pp + " tg:" + tg + " q:" + q + " dec:" + dec + " rem:" + rem + " t:" + tid;
+         + " pp:" + pp + " tg:" + tg + " pp5:" + pp5 + " tg5:" + tg5
+         + " q:" + q + " dec:" + dec + " rem:" + rem + " t:" + tid;
 }
 
 static std::string note_for(const slot_snap & s) {
@@ -373,15 +442,15 @@ static std::string note_for(const slot_snap & s) {
 }
 
 std::vector<std::string> format_frame(const global_snap & g, const std::vector<slot_snap> & slots,
-                                      const ext_snap & ext, int N) {
-    N = std::max(FRAME_MIN, std::min(N, FRAME_MAX));
+                                      const ext_snap & ext) {
     std::vector<std::string> L;
 
     // 6 fixed tagged lines
     {
         std::string ctx = fstr((double) g.n_ctx, 0) + "/" + fstr((double) g.n_ctx_train, 0);
         L.push_back("[SERVER] " + std::string(g.model_desc) + " (" + std::string(g.alias) + ")  ctx " + ctx
-                  + "  " + (g.kv_unified ? "unified" : "split") + "  KV --  FA " + std::string(g.flash_attn)
+                  + "  " + (g.kv_unified ? "unified" : "split") + "  KV " + std::string(g.kv_type)
+                  + "  FA " + std::string(g.flash_attn)
                   + "  up " + fstr((double) g.uptime_s / 3600.0, 1) + "h");
     }
     L.push_back("[RUN] busy " + fint(g.busy) + "/" + fint(g.n_slots)
@@ -402,13 +471,15 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
                   + "  rss " + bytes(g.rss) + "  cells " + fint(used_cells) + "/" + fint(resv_cells));
     }
     L.push_back("[THROUGHPUT] prompt " + fstr(g.prompt_tps, 0) + "/s  gen " + fstr(g.gen_tps, 0) + "/s"
+              + "  req " + (g.total_requests > 0 ? fstr(g.req_per_s, 1) + "/s" : std::string("-"))
               + "  spec " + (g.spec_acc >= 0 ? fstr(g.spec_acc * 100.0, 0) + "%" : "-")
               + "  hit "  + (g.hit_rate >= 0 ? fstr(g.hit_rate * 100.0, 0) + "%" : "-")
               + "  pp " + fstr(g.pp_ms_tok, 0) + "ms  tg " + fstr(g.tg_ms_tok, 0) + "ms  ftok "
               + (g.first_tok_s > 0 ? fstr(g.first_tok_s, 2) + "s" : "-"));
     if (ext.gpu_avail) {
         std::string pcie = ext.pcie_avail ? fstr(ext.pcie_rx, 0) + "M/s" : "-";
-        L.push_back("[GPU] SM " + fint(ext.gpu_sm) + "%  mem " + fint(ext.gpu_mem) + "%  pwr " + fstr(ext.gpu_pwr, 0)
+        std::string multi = ext.gpu_count > 1 ? ("x" + fint(ext.gpu_count) + "  ") : "";
+        L.push_back("[GPU] " + multi + "SM " + fint(ext.gpu_sm) + "%  mem " + fint(ext.gpu_mem) + "%  pwr " + fstr(ext.gpu_pwr, 0)
                   + "W  t " + fint(ext.gpu_temp) + "C  pclk " + fstr(ext.gpu_pclk / 1000.0, 1) + "G  mclk "
                   + fstr(ext.gpu_mclk / 1000.0, 1) + "G  pcie " + pcie);
     } else {
@@ -424,6 +495,10 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
         L.push_back("[SYSTEM] cpu " + cpu + "  ioR " + ior + "  ioW " + iow + "  req " + req);
     }
 
+    // cumulative lifetime counters
+    L.push_back("[TOTAL] prompt " + fint((long long) g.total_prompt) + "  gen " + fint((long long) g.total_gen)
+              + "  cached " + fint((long long) g.total_cached) + "  decode " + fint((long long) g.total_decode));
+
     // per-sequence blocks (allocation computed on the engine thread)
     const int n     = (int) slots.size();
     const int shown = std::min(g.n_shown, n);
@@ -432,6 +507,8 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
         const slot_snap & s = slots[i];
         L.push_back(seq_line(s));
 
+        // the last t lines (no blank padding; the printer trims to the
+        // visual budget)
         const int t = std::max(0, s.tail_lines);
         std::vector<std::string> tl;
         if (s.tail_len > 0) {
@@ -440,10 +517,9 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
         if (tl.empty()) {
             tl.push_back(note_for(s));
         }
-        // the last t lines; blank-pad to keep the frame exactly N lines
         const int start = std::max(0, (int) tl.size() - t);
-        for (int k = start; k < start + t; k++) {
-            L.push_back(k < (int) tl.size() ? tl[k] : std::string());
+        for (int k = start; k < start + t && k < (int) tl.size(); k++) {
+            L.push_back(tl[k]);
         }
     }
     if (hidden > 0) {
@@ -451,14 +527,6 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
     }
 
     L.push_back(std::string()); // trailing blank: frame separator
-
-    // safety: exactly N lines
-    while ((int) L.size() < N) {
-        L.push_back(std::string());
-    }
-    if ((int) L.size() > N) {
-        L.resize(N);
-    }
     return L;
 }
 
