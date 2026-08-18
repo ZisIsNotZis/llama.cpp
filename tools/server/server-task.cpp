@@ -1705,7 +1705,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, int id_slot) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1782,9 +1782,19 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.id_slot =*/ id_slot,
     });
 
     return &states.back();
+}
+
+bool server_prompt_cache::has_state_for(int id_slot) const {
+    for (const auto & st : states) {
+        if (st.id_slot == id_slot) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {

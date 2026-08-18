@@ -21,8 +21,9 @@ constexpr int MAX_SLOTS       = 256;  // max parallel slots we handle
 constexpr int TAIL_CHARS      = 8192; // max chars of tail kept per slot (cap)
 constexpr int TAIL_TOKENS_MIN = 64;   // min tail tokens detokenized per slot
 constexpr int TAIL_TOKENS_MAX = 1024; // max tail tokens detokenized per slot
-constexpr int FRAME_MIN       = 8;    // min frame lines (6 tags + blank + 1)
+constexpr int FRAME_MIN       = 9;    // min frame lines (fixed + blank + 1)
 constexpr int FRAME_MAX       = 200;  // max frame lines
+constexpr int FRAME_FIXED     = 8;    // fixed lines: 6 tags + [TOTAL] + blank
 
 enum class phase  { idle, prefill, decode };
 enum class kv_loc { none, ram_cache, kv_cpu, kv_gpu, kv_mixed };
@@ -48,6 +49,8 @@ struct slot_snap {
     double    t_gen_ms     = 0.0;
     int32_t   id_task      = -1;
     int       tail_lines   = 0;   // tail lines to print for this slot (engine-computed)
+    double    pp5_tps      = 0.0; // sliding-window (~5 s) prompt speed
+    double    tg5_tps      = 0.0; // sliding-window (~5 s) generation speed
     char      tail[TAIL_CHARS];
     int       tail_len     = 0;
 };
@@ -61,6 +64,7 @@ struct global_snap {
     uint32_t n_slots    = 0;
     bool    kv_unified  = false;
     char    flash_attn[16];
+    char    kv_type[32];   // "f16/f16", "--" if n/a
     bool    speculative = false;
     bool    sleeping    = false;
     int     busy        = 0;
@@ -77,6 +81,8 @@ struct global_snap {
     double  req_q_s     = 0.0;
     double  req_pp_s    = 0.0;
     double  req_gen_s   = 0.0;
+    uint64_t total_requests = 0;
+    double  req_per_s   = 0.0;
     size_t  kv_gpu      = 0;
     size_t  kv_cpu      = 0;
     size_t  weights_gpu = 0;
@@ -87,6 +93,11 @@ struct global_snap {
     size_t  ram_cache_max = 0;
     size_t  rss         = 0;
     int64_t uptime_s    = 0;
+    // cumulative lifetime counters (since server start)
+    uint64_t total_prompt   = 0;
+    uint64_t total_gen      = 0;
+    uint64_t total_cached   = 0;
+    uint64_t total_decode   = 0;
     // frame layout (engine-computed from --tui N)
     int     frame_n     = 0;   // clamped N
     int     n_shown     = 0;   // slots that get a [SEQ] line
@@ -95,6 +106,7 @@ struct global_snap {
 // external probes read on the printer thread (nvidia-smi, /proc)
 struct ext_snap {
     bool    gpu_avail   = false;
+    int     gpu_count   = 0;
     int     gpu_sm      = 0;
     int     gpu_mem     = 0;
     int     gpu_temp    = 0;

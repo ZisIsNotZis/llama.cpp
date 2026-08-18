@@ -145,7 +145,7 @@ As of the initial implementation, all S1 rows below are wired into the snapshot 
 | n_ctx / n_ctx_seq / n_ctx_train | `llama_n_ctx` (:558), `llama_n_ctx_seq` (:559), `llama_model_n_ctx_train` (:579) | S1 | available |
 | kv_unified | `params.kv_unified` | S1 | available |
 | flash_attn | `params.flash_attn_type` via `llama_flash_attn_type_name` (:196) | S1 | available |
-| kv type | no public getter | B | placeholder `-` |
+| kv type | `llama_get_kv_cache_types()` (src/llama-ext.h), fills `[SERVER] ... KV f16/f16` | B | implemented |
 | phase | `server_slot::state` enum (server-context.cpp:57) | S1 | available |
 | occupied | `llama_memory_seq_pos_max(ctx, id)` (llama.h:791) >= 0, or `slot.prompt.n_tokens()>0` | S1 | available |
 | kv_used | `llama_memory_seq_pos_max + 1` | S1 | available |
@@ -173,6 +173,11 @@ As of the initial implementation, all S1 rows below are wired into the snapshot 
 | cpu% | `/proc/self/stat` utime+stime deltas on the TUI thread | N | implemented (Linux) |
 | ioR/ioW | `/proc/self/io` read_bytes/write_bytes deltas | N | implemented (Linux) |
 | req lifecycle phases | `server_task.t_arrival_us` (stamped in `server_queue::post()`) + `slot.stats.t_start` -> queue wait; prefill/decode from slot stats; shown for the latest active task | N | implemented |
+| lifetime counters | `server_metrics.prompt.count / predict.count / n_prompt_cached / n_decode` -> `[TOTAL]` line | B | implemented |
+| req/s | `server_queue.n_requests` (user task types, counted in `post()`) + 5 s rate ring -> `[THROUGHPUT] ... req X/s` | B | implemented |
+| sliding-window speeds | per-slot 32-sample ring of `(t, n_prompt_processed, n_gen)` -> `[SEQ] pp5:/tg5:` | B | implemented |
+| RAM-cache `R` loc | `server_prompt_cache_state.id_slot` (set in `alloc`) + `has_state_for(id)` -> idle slot loc `R` | B | implemented |
+| multi-GPU | nvidia-smi parses all GPU lines: first GPU's SM/mem/temp/clocks, summed power, `xN` prefix | B | implemented |
 
 Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; loc derives from which backends are present in the breakdown for the KV context buffer and whether the slot is resident. RAM-cache-only requires the server to know an idle slot was cleared after being saved (see section 9.5).
 
@@ -183,10 +188,10 @@ None. The printer thread only does `fwrite`/`fflush(stdout)`. No alt-screen, no 
 ## 9. Frame format and line budget
 
 - The printer builds one frame per second: exactly `N` lines, `N = clamp(tui, 8, 200)`.
-- Lines 1-6 are tagged: `[SERVER] ...`, `[RUN] ...`, `[MEMORY] ...`, `[THROUGHPUT] ...`, `[GPU] ...`, `[SYSTEM] ...`.
-- Then per-slot blocks, then 1 trailing blank line (frame separator).
+- Lines 1-7 are tagged: `[SERVER] ...`, `[RUN] ...`, `[MEMORY] ...`, `[THROUGHPUT] ...`, `[GPU] ...`, `[SYSTEM] ...`, `[TOTAL] ...` (cumulative lifetime counters).
+- Then per-slot blocks, then 1 trailing blank line (frame separator). Fixed lines total `FRAME_FIXED = 8` (7 tags + blank).
 - Allocation (matches DESIGN.md section 7):
-  - `content = N - 7` lines available for `[SEQ]` + tails.
+  - `content = N - FRAME_FIXED` lines available for `[SEQ]` + tails.
   - `shown = min(n_slots, content)`; `hidden = n_slots - shown`; `note = hidden > 0 ? 1 : 0`; if `shown + note > content`, shrink `shown` to `content - note`.
   - `tail_budget = content - shown - note`; per-slot `t_i = tail_budget / shown`, and the last `rem = tail_budget % shown` cells get `+1` (the last cell may be longer).
   - if `hidden > 0`, emit `[SKIP] +K hidden` as the final block line.
@@ -261,3 +266,6 @@ None. The printer thread only does `fwrite`/`fflush(stdout)`. No alt-screen, no 
 | 2026-02-14 | Tail box fix: split tail text on newlines, wrap each logical line, sanitize control chars so the box stays aligned with multi-line chat content. | owner |
 | 2026-02-14 | Design change: drop the `...` truncation marker (broke alignment); SEQUENCES uses inline `k:v` summary labels instead of a far-away table header (column header row removed, fixed band now 10 rows). | owner |
 | 2026-02-14 | Major redesign: plain-text timely-output program. `--tui N` = exact lines per frame; tagged lines (`[SERVER]`/`[RUN]`/.../`[SEQ n]`); no terminal control/width/ncurses; per-slot `tail_lines` computed on the engine thread; tail token budget `~ t x 32`; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:`; trailing blank frame separator. | owner |
+| 2026-02-14 | Tier B (partial): `[TOTAL]` lifetime counters line; `[SERVER]` KV cache types via `llama_get_kv_cache_types()` (new llama-ext API); snapshot publishes on sleep-state change (model info carried over, no more stale `[RUN]` while sleeping). | owner |
+| 2026-02-14 | Bug fix: one concatenated single-write frame (no jitter); terminal width at boot used to estimate per-line visual rows (lines wrap in the terminal) and trim the frame to ~N visual rows; no manual wrapping. | owner |
+| 2026-02-14 | Tier B complete: `req/s` (task counter + rate ring), sliding-window per-slot `pp5:`/`tg5:` speeds, per-slot RAM-cache `R` attribution (`server_prompt_cache_state.id_slot`), multi-GPU `[GPU]` (all nvidia-smi lines, summed power, `xN`). | owner |

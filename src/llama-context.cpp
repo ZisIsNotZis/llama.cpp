@@ -391,6 +391,8 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+        kv_type_k = params.type_k;
+        kv_type_v = params.type_v;
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
@@ -4212,6 +4214,11 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_get_kv_cache_types(const struct llama_context * ctx, ggml_type * type_k, ggml_type * type_v) {
+    *type_k = ctx->get_kv_type_k();
+    *type_v = ctx->get_kv_type_v();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
