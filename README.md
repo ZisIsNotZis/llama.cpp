@@ -62,6 +62,7 @@ a wide range of hardware - locally and in the cloud.
 - Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
 - Vulkan and SYCL backend support
 - CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+- Live TUI dashboard for `llama-server` (`--tui`): shows all sequences (phase, KV memory, cache hits, speeds, live tail), plus memory/throughput/GPU utilization in a btop-style layout. Opt-in, only when stdout is a terminal; `--no-tui` disables it.
 
 The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
 

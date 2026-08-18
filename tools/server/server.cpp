@@ -542,7 +542,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         // this call blocks the main thread until queue_tasks.terminate() is called
+        ctx_server.start_tui();
         ctx_server.start_loop();
+        ctx_server.stop_tui();
 
         clean_up();
         if (ctx_http.thread.joinable()) {
