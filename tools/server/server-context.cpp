@@ -5583,16 +5583,23 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     }
     g.engine_busy = ctx.engine_busy_ratio(ggml_time_us());
 
-    // first-token latency: the most recently launched active slot
+    // request lifecycle phases of the most recently launched active task
     {
         int64_t best_task = -1;
         for (const auto & s : ctx.slots) {
             if (!s.is_processing() || !s.task) {
                 continue;
             }
-            if (s.stats.t_prompt_ms() > 0 && (int64_t) s.task->id > best_task) {
+            if ((int64_t) s.task->id > best_task) {
                 best_task = s.task->id;
-                g.first_tok_s = s.stats.t_prompt_ms() / 1000.0;
+                g.req_valid = true;
+                g.req_pp_s  = s.stats.t_prompt_ms() / 1000.0;
+                g.req_gen_s = s.stats.t_gen_ms() / 1000.0;
+                g.req_q_s   = s.stats.t_start > 0 && s.task->t_arrival_us > 0
+                            ? std::max(0.0, (double) (s.stats.t_start - s.task->t_arrival_us) / 1e6) : 0.0;
+                if (s.stats.t_prompt_ms() > 0) {
+                    g.first_tok_s = s.stats.t_prompt_ms() / 1000.0;
+                }
             }
         }
     }
@@ -5643,6 +5650,8 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         d.t_last_used     = s.t_last_used;
         d.idle_age_s      = !s.is_processing() && s.t_last_used > 0
                           ? (int32_t) ((ggml_time_us() - s.t_last_used) / 1000000) : -1;
+        d.queue_ms        = s.task && s.stats.t_start > 0 && s.task->t_arrival_us > 0
+                          ? std::max(0.0, (double) (s.stats.t_start - s.task->t_arrival_us) / 1000.0) : 0.0;
         d.pp_tps          = s.stats.n_prompt_tps();
         d.tg_tps          = s.stats.n_gen_tps();
         d.t_prompt_ms     = s.stats.t_prompt_ms();

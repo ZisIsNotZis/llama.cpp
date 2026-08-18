@@ -42,7 +42,9 @@ New:
 
 Modified:
 
-- `tools/server/server-context.cpp/.h` - publish snapshot after `update_slots()` (server-context.cpp:2699); add engine-busy timing around it; expose `llama_get_memory_breakdown()` data and prompt-cache size.
+- `tools/server/server-context.cpp/.h` - publish snapshot after `update_slots()` (server-context.cpp:2699); add engine-busy timing around it; expose `llama_get_memory_breakdown()` data, prompt-cache size, and request lifecycle phases.
+- `tools/server/server-task.h` - add `t_arrival_us` to `server_task`.
+- `tools/server/server-queue.cpp` - stamp `t_arrival_us` in `post()` (queue-wait baseline).
 - `tools/server/server.cpp` - `--tui` wiring; start/stop TUI thread around `ctx_server.start_loop()`; terminal restore in `clean_up()` path.
 - `tools/server/server-common.h` - server params field `tui`.
 - `common/arg.cpp`, `common/common.h` - new `--tui` / `--no-tui` flag and env `LLAMA_ARG_TUI`.
@@ -167,10 +169,11 @@ As of the initial implementation, all S1 rows below are wired into the snapshot 
 | ram_cache | `prompt_cache->size()` and limit (server-task.h:592) | S1 | available |
 | rss | Linux: `/proc/self/statm` (or `getrusage` peak fallback); else 0 | S1 | Linux only |
 | uptime | `metrics.t_start` vs now | S1 | available |
-| GPU SM/mem/temp/pwr/clocks/pcie | `nvidia-smi --query-gpu=...` one-shot subprocess per tick | N | placeholder |
-| cpu% | `/proc/stat` deltas or process CPU time | N | placeholder |
-| ioR/ioW | `/proc/self/io` read_bytes/write_bytes deltas | N | placeholder |
-| req lifecycle phases | needs task arrival timestamp in queue (not present today) | N | placeholder |
+| GPU SM/mem/temp/pwr/clocks | `nvidia-smi --query-gpu=...` one-shot subprocess on the TUI thread (tui.cpp) | N | implemented (Linux) |
+| pcie rx/tx | `nvidia-smi --query-gpu=pcie.rx_bytes,pcie.tx_bytes` (separate probe; not on all drivers) | N | implemented (falls back to `-`) |
+| cpu% | `/proc/self/stat` utime+stime deltas on the TUI thread | N | implemented (Linux) |
+| ioR/ioW | `/proc/self/io` read_bytes/write_bytes deltas | N | implemented (Linux) |
+| req lifecycle phases | `server_task.t_arrival_us` (stamped in `server_queue::post()`) + `slot.stats.t_start` -> queue wait; prefill/decode from slot stats; shown for the latest active task | N | implemented |
 
 Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; loc derives from which backends are present in the breakdown for the KV context buffer and whether the slot is resident. RAM-cache-only requires the server to know an idle slot was cleared after being saved (see section 9.5).
 
@@ -271,3 +274,5 @@ Note on loc: KV may be on GPU and CPU simultaneously for a layer-split model; lo
 |---|---|---|
 | 2026-02-14 | Initial baseline | owner |
 | 2026-02-14 | Initial implementation: snapshot struct, publish hook, controller, renderer, `--tui` flag, router LOG->stderr, `tui.cpp`/`tui.h`. S1 fields implemented; N/B placeholders. | owner |
+| 2026-02-14 | Tier N (partial): GPU panel via `nvidia-smi` (SM/mem/temp/pwr/clocks, pcie fallback) and SYSTEM panel via `/proc` (process CPU%, disk IO rates), read on the TUI thread into `ext_snap`. | owner |
+| 2026-02-14 | Tier N complete: request lifecycle phases (`req q Xs pp Xs dec Xs`) via `server_task.t_arrival_us` stamped in `server_queue::post()`. | owner |

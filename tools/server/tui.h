@@ -35,6 +35,7 @@ struct slot_snap {
     int32_t  n_remain   = -1;
     int64_t  t_last_used = 0;  // us since epoch, 0 if never
     int32_t  idle_age_s  = -1; // seconds since last use, -1 if n/a
+    double   queue_ms    = 0.0; // queue wait for the current task
     double   pp_tps     = 0.0;
     double   tg_tps     = 0.0;
     double   t_prompt_ms = 0.0;
@@ -42,6 +43,26 @@ struct slot_snap {
     int32_t  id_task    = -1;
     char     tail[TAIL_CHARS];
     int      tail_len   = 0;
+};
+
+// external probes read on the TUI thread (nvidia-smi, /proc)
+struct ext_snap {
+    // GPU (nvidia-smi)
+    bool   gpu_avail = false;
+    int    gpu_sm    = 0; // %
+    int    gpu_mem   = 0; // % memory utilization
+    int    gpu_temp  = 0; // C
+    double gpu_pwr   = 0; // W
+    double gpu_pclk  = 0; // MHz
+    double gpu_mclk  = 0; // MHz
+    double pcie_rx   = 0; // MB/s
+    double pcie_tx   = 0; // MB/s
+    bool   pcie_avail = false;
+    // system (/proc, Linux)
+    bool   proc_avail = false;
+    double cpu_pct    = 0; // process CPU %
+    double io_r       = 0; // MB/s
+    double io_w       = 0; // MB/s
 };
 
 struct global_snap {
@@ -66,6 +87,11 @@ struct global_snap {
     double  pp_ms_tok   = 0.0;
     double  tg_ms_tok   = 0.0;
     double  first_tok_s = 0.0;
+    // request lifecycle phases of the most recently launched active task
+    bool    req_valid = false;
+    double  req_q_s   = 0.0;  // queue wait
+    double  req_pp_s  = 0.0;  // prefill time
+    double  req_gen_s = 0.0;  // decode time
     size_t  kv_gpu      = 0; // context memory on non-host backends
     size_t  kv_cpu      = 0; // context memory on host backend
     size_t  weights_gpu = 0;
@@ -113,6 +139,18 @@ private:
     snapshot &        snap_;
     std::thread       thread_;
     std::atomic<bool> running_ {false};
+
+    // external probe data + previous sample state (rate deltas)
+    ext_snap  ext_;
+    uint64_t  pcie_rx_prev = 0;
+    uint64_t  pcie_tx_prev = 0;
+    int64_t   pcie_t_prev  = 0;
+    uint64_t  io_r_prev    = 0;
+    uint64_t  io_w_prev    = 0;
+    uint64_t  cpu_ticks_prev = 0;
+    int64_t   proc_t_prev  = 0;
+
+    void read_ext();
 };
 
 } // namespace tui

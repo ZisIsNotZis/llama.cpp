@@ -23,6 +23,7 @@
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    task.t_arrival_us = ggml_time_us();
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -45,6 +46,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         if (task.id == -1) {
             task.id = id++;
         }
+        task.t_arrival_us = ggml_time_us();
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);

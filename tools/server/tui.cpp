@@ -6,6 +6,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -137,7 +139,146 @@ static std::string fmt(double v, int prec) {
 }
 
 // defined later in this file
-std::string render(const global_snap & g, const std::vector<slot_snap> & slots, int W, int H);
+std::string render(const global_snap & g, const std::vector<slot_snap> & slots, const ext_snap & ext, int W, int H);
+
+// ---------------------------------------------------------------------------
+// external probes (nvidia-smi, /proc) - run on the TUI thread, never the engine
+// ---------------------------------------------------------------------------
+
+#if defined(__linux__)
+static bool nvidia_smi_probe(int & sm, int & mem, int & temp, double & pwr, double & pclk, double & mclk) {
+    FILE * p = popen("nvidia-smi --query-gpu=utilization.gpu,utilization.memory,temperature.gpu,power.draw,"
+                     "clocks.sm,clocks.mem --format=csv,noheader,nounits 2>/dev/null", "r");
+    if (!p) {
+        return false;
+    }
+    char line[512];
+    bool ok = fgets(line, sizeof(line), p) != nullptr;
+    pclose(p);
+    if (!ok) {
+        return false;
+    }
+    return sscanf(line, "%d,%d,%d,%lf,%lf,%lf", &sm, &mem, &temp, &pwr, &pclk, &mclk) == 6;
+}
+
+// pcie counters are not supported on all drivers; tolerate failure
+static bool nvidia_smi_pcie_probe(unsigned long long & rx, unsigned long long & tx) {
+    FILE * p = popen("nvidia-smi --query-gpu=pcie.rx_bytes,pcie.tx_bytes --format=csv,noheader,nounits 2>/dev/null", "r");
+    if (!p) {
+        return false;
+    }
+    char line[256];
+    bool ok = fgets(line, sizeof(line), p) != nullptr;
+    pclose(p);
+    if (!ok) {
+        return false;
+    }
+    return sscanf(line, "%llu,%llu", &rx, &tx) == 2;
+}
+
+static bool proc_read(uint64_t & io_r, uint64_t & io_w, uint64_t & cpu_ticks) {
+    io_r = 0;
+    io_w = 0;
+    {
+        std::ifstream f("/proc/self/io");
+        std::string k;
+        uint64_t v = 0;
+        while (f >> k >> v) {
+            if      (k == "read_bytes:")  io_r = v;
+            else if (k == "write_bytes:") io_w = v;
+        }
+    }
+    {
+        std::ifstream f("/proc/self/stat");
+        std::string s;
+        if (!std::getline(f, s)) {
+            return false;
+        }
+        const size_t p = s.rfind(')'); // comm may contain spaces/parens
+        if (p == std::string::npos) {
+            return false;
+        }
+        std::istringstream iss(s.substr(p + 1));
+        uint64_t v = 0;
+        int count = 0;
+        uint64_t utime = 0;
+        uint64_t stime = 0;
+        while (iss >> v) {
+            count++;
+            if      (count == 12) utime = v; // field 14
+            else if (count == 13) stime = v; // field 15
+            if (count > 13) break;
+        }
+        cpu_ticks = utime + stime;
+    }
+    return true;
+}
+#endif
+
+void controller::read_ext() {
+    const int64_t now = (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+#if defined(__linux__)
+    int sm = 0, mem = 0, temp = 0;
+    double pwr = 0, pclk = 0, mclk = 0;
+    if (nvidia_smi_probe(sm, mem, temp, pwr, pclk, mclk)) {
+        ext_.gpu_avail = true;
+        ext_.gpu_sm   = sm;
+        ext_.gpu_mem  = mem;
+        ext_.gpu_temp = temp;
+        ext_.gpu_pwr  = pwr;
+        ext_.gpu_pclk = pclk;
+        ext_.gpu_mclk = mclk;
+    } else {
+        ext_.gpu_avail = false;
+    }
+
+    unsigned long long rx = 0, tx = 0;
+    if (nvidia_smi_pcie_probe(rx, tx)) {
+        ext_.pcie_avail = true;
+        if (pcie_t_prev > 0 && now > pcie_t_prev) {
+            const double dt = (now - pcie_t_prev) / 1e6;
+            ext_.pcie_rx = dt > 0 ? (double) (rx - pcie_rx_prev) / dt / 1024.0 / 1024.0 : 0.0;
+            ext_.pcie_tx = dt > 0 ? (double) (tx - pcie_tx_prev) / dt / 1024.0 / 1024.0 : 0.0;
+        } else {
+            ext_.pcie_rx = 0;
+            ext_.pcie_tx = 0;
+        }
+        pcie_rx_prev = rx;
+        pcie_tx_prev = tx;
+        pcie_t_prev  = now;
+    } else {
+        ext_.pcie_avail = false;
+        ext_.pcie_rx    = 0;
+        ext_.pcie_tx    = 0;
+    }
+
+    uint64_t io_r = 0, io_w = 0, cpu_ticks = 0;
+    if (proc_read(io_r, io_w, cpu_ticks)) {
+        ext_.proc_avail = true;
+        if (proc_t_prev > 0 && now > proc_t_prev) {
+            const double dt = (now - proc_t_prev) / 1e6;
+            const double clk = (double) sysconf(_SC_CLK_TCK);
+            ext_.cpu_pct = dt > 0 ? (double) (cpu_ticks - cpu_ticks_prev) / clk / dt * 100.0 : 0.0;
+            ext_.io_r    = dt > 0 ? (double) (io_r - io_r_prev) / dt / 1024.0 / 1024.0 : 0.0;
+            ext_.io_w    = dt > 0 ? (double) (io_w - io_w_prev) / dt / 1024.0 / 1024.0 : 0.0;
+        } else {
+            ext_.cpu_pct = 0;
+            ext_.io_r    = 0;
+            ext_.io_w    = 0;
+        }
+        cpu_ticks_prev = cpu_ticks;
+        io_r_prev      = io_r;
+        io_w_prev      = io_w;
+        proc_t_prev    = now;
+    } else {
+        ext_.proc_avail = false;
+    }
+#else
+    ext_.gpu_avail  = false;
+    ext_.proc_avail = false;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // controller
@@ -183,6 +324,7 @@ void controller::run() {
     fflush(stdout);
 
     while (running_) {
+        read_ext();
         int W = 80;
         int H = 24;
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -201,7 +343,7 @@ void controller::run() {
             slots.assign(snap_.slots, snap_.slots + n);
         }
 
-        std::string frame = render(g, slots, W, H);
+        std::string frame = render(g, slots, ext_, W, H);
 
         fputs("\033[H", stdout);
         fputs(frame.c_str(), stdout);
@@ -347,7 +489,7 @@ static std::vector<std::string> wrap_tail(const char * text, int len, size_t col
 
 } // namespace
 
-std::string render(const global_snap & g, const std::vector<slot_snap> & slots, int W_in, int H_in) {
+std::string render(const global_snap & g, const std::vector<slot_snap> & slots, const ext_snap & ext, int W_in, int H_in) {
     const int W = std::max(24, std::min(W_in, 400));
     const int H = std::max(8, std::min(H_in, 500));
 
@@ -448,18 +590,47 @@ std::string render(const global_snap & g, const std::vector<slot_snap> & slots, 
     }
     (void) L;
 
-    // ---- GPU | SYSTEM body (placeholders) ---------------------------------
+    // ---- GPU | SYSTEM body ------------------------------------------------
     {
-        std::string a = " SM -   mem -   pwr -   temp -";
-        std::string b = " cpu -   ioR -   ioW -";
+        char buf[256];
+        if (ext.gpu_avail) {
+            snprintf(buf, sizeof(buf), " SM %d%%   mem %d%%   pwr %.0fW  temp %dC",
+                     ext.gpu_sm, ext.gpu_mem, ext.gpu_pwr, ext.gpu_temp);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", " SM -   mem -   pwr -   temp -");
+        }
+        std::string a = buf;
+        if (ext.proc_avail) {
+            snprintf(buf, sizeof(buf), " cpu %.0f%%  ioR %.0fM/s  ioW %.0fM/s", ext.cpu_pct, ext.io_r, ext.io_w);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", " cpu -   ioR -   ioW -");
+        }
+        std::string b = buf;
         size_t L2 = (size_t) ((W - 2) / 2 - 1);
         pad_cols(a, L2);
         pad_cols(b, (size_t) (W - 2) - L2 - 1);
         out += "\xe2\x94\x82" + a + "\xe2\x94\x82" + b + "\xe2\x94\x82\n";
     }
     {
-        std::string a = " pclk -   mclk -   pcie -";
-        std::string b = " req phases -";
+        char buf[256];
+        if (ext.gpu_avail && ext.pcie_avail) {
+            snprintf(buf, sizeof(buf), " pclk %.1fG  mclk %.1fG  pcie rx %.0fM/s  tx %.0fM/s",
+                     ext.gpu_pclk / 1000.0, ext.gpu_mclk / 1000.0, ext.pcie_rx, ext.pcie_tx);
+        } else if (ext.gpu_avail) {
+            snprintf(buf, sizeof(buf), " pclk %.1fG  mclk %.1fG  pcie -",
+                     ext.gpu_pclk / 1000.0, ext.gpu_mclk / 1000.0);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", " pclk -   mclk -   pcie -");
+        }
+        std::string a = buf;
+        std::string b;
+        if (g.req_valid) {
+            char rb[128];
+            snprintf(rb, sizeof(rb), " req q %.1fs pp %.1fs dec %.1fs", g.req_q_s, g.req_pp_s, g.req_gen_s);
+            b = rb;
+        } else {
+            b = " req phases -";
+        }
         size_t L2 = (size_t) ((W - 2) / 2 - 1);
         pad_cols(a, L2);
         pad_cols(b, (size_t) (W - 2) - L2 - 1);

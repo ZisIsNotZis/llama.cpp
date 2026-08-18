@@ -136,6 +136,9 @@ struct task_result_state {
 struct server_task {
     int id = -1; // to be filled by server_queue
 
+    // arrival time (us) when the task was enqueued, set in server_queue::post()
+    int64_t t_arrival_us = 0;
+
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
