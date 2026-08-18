@@ -596,6 +596,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
     int id_slot = -1; // owning slot (for the TUI RAM-cache loc), -1 = unknown
+    int64_t t_created  = 0;    // sequence creation time (us)
+    int64_t t_modified = 0;    // last save/access (us)
+    double  hit_rate   = -1.0; // per-sequence cache hit rate, -1 = n/a
 
     size_t size() const {
         size_t res = data.size();

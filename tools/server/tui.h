@@ -85,6 +85,8 @@ struct global_snap {
     double  req_per_s   = 0.0;
     size_t  kv_gpu      = 0;
     size_t  kv_cpu      = 0;
+    size_t  kv_gpu_used = 0; // used KV bytes (fraction of reserved by used cells)
+    size_t  kv_cpu_used = 0;
     size_t  weights_gpu = 0;
     size_t  weights_cpu = 0;
     size_t  compute_gpu = 0;

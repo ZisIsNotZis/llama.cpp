@@ -25,6 +25,8 @@ export const SETTINGS_SECTION_SLUGS = {
 export const ROUTES = {
 	/** Chat base — for dynamic chat URLs use RouterService. */
 	CHAT: '#/chat',
+	/** Live sequence dashboard. */
+	DASHBOARD: '#/dashboard',
 	/** MCP servers. */
 	MCP_SERVERS: '#/mcp-servers',
 	/** New chat — root with new chat query param. */

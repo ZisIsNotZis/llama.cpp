@@ -3,6 +3,8 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-dash.h"
+#include "tui.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -100,6 +102,12 @@ struct server_context {
     void start_tui();
     void stop_tui();
 
+    // shared sequence feed for the web dashboard (see docs/dashboard/WEB.md)
+    dash::feed & get_dash_feed();
+
+    // status snapshot (global + per-slot), shared with the TUI
+    tui::snapshot & get_tui_snapshot();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
@@ -133,6 +141,7 @@ struct server_routes {
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
+    server_http_context::handler_t get_dashboard;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;
@@ -178,7 +187,7 @@ private:
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    const server_context_impl & ctx_server;
+    server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;
