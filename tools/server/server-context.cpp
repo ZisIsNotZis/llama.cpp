@@ -5647,8 +5647,8 @@ void server_context_impl::tui_publish() {
 }
 
 void server_context_impl::start_tui() {
-    if (params_base.tui) {
-        tui_ctl.start();
+    if (params_base.tui > 0) {
+        tui_ctl.start(params_base.tui);
     }
 }
 
@@ -5724,6 +5724,11 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     }
     g.engine_busy = ctx.engine_busy_ratio(ggml_time_us());
 
+    // frame layout: per-slot tail line allocation (--tui N)
+    const int n_slots = (int) std::min(ctx.slots.size(), (size_t) MAX_SLOTS);
+    const tail_alloc_t alloc = tail_alloc(ctx.params_base.tui, n_slots);
+    g.frame_n = std::max(FRAME_MIN, std::min(ctx.params_base.tui, FRAME_MAX));
+    g.n_shown = alloc.shown;
     // request lifecycle phases of the most recently launched active task
     {
         int64_t best_task = -1;
@@ -5747,8 +5752,7 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
 
     slot_snap tmp[MAX_SLOTS];
     int n = 0;
-    const size_t n_slots = std::min(ctx.slots.size(), (size_t) MAX_SLOTS);
-    for (size_t i = 0; i < n_slots; i++) {
+    for (size_t i = 0; i < (size_t) n_slots; i++) {
         const server_slot & s = ctx.slots[i];
         slot_snap & d = tmp[n];
 
@@ -5798,14 +5802,17 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         d.t_prompt_ms     = s.stats.t_prompt_ms();
         d.t_gen_ms        = s.stats.t_gen_ms();
 
-        // tail: generated tokens, or prompt tail while prefilling
+        d.tail_lines = alloc.per_slot[i];
+
+        // tail: generated tokens, or prompt tokens (shown in any state)
         std::string tail_text;
-        if (ctx.ctx_tgt) {
+        if (ctx.ctx_tgt && d.tail_lines > 0) {
+            const int n_tok = std::min(TAIL_TOKENS_MAX, std::max(TAIL_TOKENS_MIN, d.tail_lines * 32));
             if (s.generated_tokens.size() > 0) {
-                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(s.generated_tokens, TAIL_TOKENS), true);
-            } else if (s.task) {
+                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(s.generated_tokens, (size_t) n_tok), true);
+            } else if (s.prompt.n_tokens() > 0) {
                 const llama_tokens & toks = s.prompt.tokens.get_tokens();
-                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(toks, TAIL_TOKENS), true);
+                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(toks, (size_t) n_tok), true);
             }
         }
         while (!tail_text.empty() && (tail_text.back() == '\n' || tail_text.back() == '\r')) {
