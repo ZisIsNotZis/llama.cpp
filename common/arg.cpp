@@ -1727,6 +1727,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--tui"},
+        {"--no-tui"},
+        string_format("show the TUI dashboard on stdout when it is a terminal (default: %s)", params.tui ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.tui = value;
+        }
+    ).set_env("LLAMA_ARG_TUI").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

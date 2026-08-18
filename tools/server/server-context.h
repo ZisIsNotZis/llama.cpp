@@ -96,6 +96,10 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // TUI dashboard (see docs/dashboard): opt-in, stdout only when a tty
+    void start_tui();
+    void stop_tui();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

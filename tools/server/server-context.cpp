@@ -7,6 +7,9 @@
 #include "server-schema.h"
 #include "server-stream.h"
 
+#include "tui.h"
+#include "src/llama-ext.h"
+
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -25,6 +28,10 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -788,6 +795,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 
 struct server_context_impl {
     friend struct server_context;
+    friend void tui::fill_snapshot(tui::snapshot & snap, server_context_impl & ctx);
 
 public:
     // only use these pointers outside of this class:
@@ -805,6 +813,10 @@ public:
     server_chat_params chat_params;
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
+
+    // TUI dashboard lifecycle (see docs/dashboard)
+    void start_tui();
+    void stop_tui();
 
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
@@ -878,6 +890,22 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+
+    // TUI dashboard
+    tui::snapshot  tui_snap;
+    tui::controller tui_ctl { tui_snap };
+
+    // engine busy tracking (rolling window over update_slots time)
+    int64_t engine_busy_us       = 0;
+    int64_t engine_ring_t[64]    = {0};
+    int64_t engine_ring_busy[64] = {0};
+    int     engine_ring_head     = 0;
+    int     engine_ring_n        = 0;
+    int64_t tui_last_publish_us  = 0;
+
+    void engine_busy_sample(int64_t dt_us, int64_t t_us);
+    double engine_busy_ratio(int64_t now_us);
+    void tui_publish();
 
     void destroy() {
         spec.reset();
@@ -1360,7 +1388,11 @@ private:
             return process_single_task(std::move(task), is_yielding);
         });
         queue_tasks.on_update_slots([this]() {
+            const int64_t t0 = ggml_time_us();
             update_slots();
+            const int64_t t1 = ggml_time_us();
+            engine_busy_sample(t1 - t0, t1);
+            tui_publish();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -4064,6 +4096,14 @@ void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
 
+void server_context::start_tui() {
+    impl->start_tui();
+}
+
+void server_context::stop_tui() {
+    impl->stop_tui();
+}
+
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
@@ -5388,3 +5428,253 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     res->ok(response);
     return res;
 }
+
+//
+// TUI dashboard (see docs/dashboard)
+//
+
+static llama_tokens tui_last_tokens(const llama_tokens & toks, size_t k) {
+    if (toks.size() <= k) {
+        return toks;
+    }
+    return llama_tokens(toks.end() - k, toks.end());
+}
+
+static size_t tui_rss_bytes() {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    std::ifstream f("/proc/self/statm");
+    if (f) {
+        unsigned long total = 0;
+        unsigned long resident = 0;
+        if (f >> total >> resident) {
+            return (size_t) resident * (size_t) sysconf(_SC_PAGESIZE);
+        }
+    }
+#endif
+    return 0;
+}
+
+void server_context_impl::engine_busy_sample(int64_t dt_us, int64_t t_us) {
+    engine_busy_us += dt_us;
+    engine_ring_t[engine_ring_head]    = t_us;
+    engine_ring_busy[engine_ring_head] = engine_busy_us;
+    engine_ring_head = (engine_ring_head + 1) % 64;
+    if (engine_ring_n < 64) {
+        engine_ring_n++;
+    }
+}
+
+double server_context_impl::engine_busy_ratio(int64_t now_us) {
+    constexpr int64_t WINDOW = 5 * 1000 * 1000;
+    if (engine_ring_n == 0) {
+        return 0.0;
+    }
+    const int64_t want = now_us - WINDOW;
+    int64_t base_t    = 0;
+    int64_t base_busy = 0;
+    for (int i = 0; i < engine_ring_n; i++) {
+        const int idx = (engine_ring_head - 1 - i + 64) % 64;
+        if (engine_ring_t[idx] <= want) {
+            base_t    = engine_ring_t[idx];
+            base_busy = engine_ring_busy[idx];
+            break;
+        }
+    }
+    if (base_t == 0) {
+        const int idx = (engine_ring_head - 1 + 64) % 64;
+        base_t    = engine_ring_t[idx];
+        base_busy = engine_ring_busy[idx];
+    }
+    const int64_t elapsed = now_us - base_t;
+    const int64_t busy    = engine_busy_us - base_busy;
+    if (elapsed <= 0) {
+        return 0.0;
+    }
+    return std::min(1.0, (double) busy / (double) elapsed);
+}
+
+void server_context_impl::tui_publish() {
+    if (!tui_ctl.is_active()) {
+        return;
+    }
+    const int64_t now = ggml_time_us();
+    if (now - tui_last_publish_us < 100 * 1000) {
+        return; // throttle to 10 Hz
+    }
+    tui_last_publish_us = now;
+    tui::fill_snapshot(tui_snap, *this);
+}
+
+void server_context_impl::start_tui() {
+    if (params_base.tui) {
+        tui_ctl.start();
+    }
+}
+
+void server_context_impl::stop_tui() {
+    tui_ctl.stop();
+}
+
+namespace tui {
+
+void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
+    global_snap g;
+
+    if (ctx.model_tgt) {
+        char buf[256];
+        llama_model_desc(ctx.model_tgt, buf, sizeof(buf));
+        snprintf(g.model_desc, sizeof(g.model_desc), "%s", buf);
+    }
+    if (!ctx.params_base.model_alias.empty()) {
+        snprintf(g.alias, sizeof(g.alias), "%s", ctx.params_base.model_alias.begin()->c_str());
+    }
+
+    g.n_ctx       = ctx.ctx_tgt ? llama_n_ctx(ctx.ctx_tgt) : 0;
+    g.n_ctx_seq   = ctx.ctx_tgt ? llama_n_ctx_seq(ctx.ctx_tgt) : 0;
+    g.n_ctx_train = ctx.model_tgt ? llama_model_n_ctx_train(ctx.model_tgt) : 0;
+    g.n_slots     = (uint32_t) ctx.slots.size();
+    g.kv_unified  = ctx.params_base.kv_unified;
+    snprintf(g.flash_attn, sizeof(g.flash_attn), "%s", llama_flash_attn_type_name(ctx.params_base.flash_attn_type));
+    g.speculative = ctx.spec != nullptr;
+    g.sleeping    = ctx.sleeping;
+    g.deferred    = ctx.queue_tasks.queue_tasks_deferred_size();
+    g.busy        = 0;
+
+    // memory breakdown per backend (model / context / compute)
+    if (ctx.ctx_tgt) {
+        for (const auto & [buft, data] : llama_get_memory_breakdown(ctx.ctx_tgt)) {
+            if (ggml_backend_buft_is_host(buft)) {
+                g.kv_cpu      += data.context;
+                g.weights_cpu += data.model;
+                g.compute_cpu += data.compute;
+            } else {
+                g.kv_gpu      += data.context;
+                g.weights_gpu += data.model;
+                g.compute_gpu += data.compute;
+            }
+        }
+    }
+
+    if (ctx.prompt_cache) {
+        g.ram_cache     = ctx.prompt_cache->size();
+        g.ram_cache_max = ctx.prompt_cache->limit_size;
+    }
+    g.rss = tui_rss_bytes();
+    g.uptime_s = (ggml_time_us() - ctx.metrics.t_start) / 1000000;
+    if (g.uptime_s < 0) {
+        g.uptime_s = 0;
+    }
+
+    // throughput gauges
+    g.prompt_tps = ctx.metrics.prompt_bucket.n_per_second();
+    g.gen_tps    = ctx.metrics.predict_bucket.n_per_second();
+    if (ctx.metrics.n_draft_tokens > 0) {
+        g.spec_acc = (double) ctx.metrics.n_draft_accepted / (double) ctx.metrics.n_draft_tokens;
+    }
+    const uint64_t prompt_total = ctx.metrics.prompt.count + ctx.metrics.n_prompt_cached;
+    if (prompt_total > 0) {
+        g.hit_rate = (double) ctx.metrics.n_prompt_cached / (double) prompt_total;
+    }
+    if (ctx.metrics.prompt.count > 0) {
+        g.pp_ms_tok = (double) ctx.metrics.prompt.time / (double) ctx.metrics.prompt.count / 1000.0;
+    }
+    if (ctx.metrics.predict.count > 0) {
+        g.tg_ms_tok = (double) ctx.metrics.predict.time / (double) ctx.metrics.predict.count / 1000.0;
+    }
+    g.engine_busy = ctx.engine_busy_ratio(ggml_time_us());
+
+    // first-token latency: the most recently launched active slot
+    {
+        int64_t best_task = -1;
+        for (const auto & s : ctx.slots) {
+            if (!s.is_processing() || !s.task) {
+                continue;
+            }
+            if (s.stats.t_prompt_ms() > 0 && (int64_t) s.task->id > best_task) {
+                best_task = s.task->id;
+                g.first_tok_s = s.stats.t_prompt_ms() / 1000.0;
+            }
+        }
+    }
+
+    slot_snap tmp[MAX_SLOTS];
+    int n = 0;
+    const size_t n_slots = std::min(ctx.slots.size(), (size_t) MAX_SLOTS);
+    for (size_t i = 0; i < n_slots; i++) {
+        const server_slot & s = ctx.slots[i];
+        slot_snap & d = tmp[n];
+
+        d.id = s.id;
+        d.id_task = s.task ? s.task->id : -1;
+        switch (s.state) {
+            case SLOT_STATE_IDLE:                 d.ph = phase::idle;    break;
+            case SLOT_STATE_WAIT_OTHER:
+            case SLOT_STATE_STARTED:
+            case SLOT_STATE_PROCESSING_PROMPT:
+            case SLOT_STATE_DONE_PROMPT:          d.ph = phase::prefill; break;
+            case SLOT_STATE_GENERATING:           d.ph = phase::decode;  break;
+            default:                              d.ph = phase::idle;    break;
+        }
+
+        llama_pos pmax = -1;
+        if (ctx.ctx_tgt) {
+            pmax = llama_memory_seq_pos_max(llama_get_memory(ctx.ctx_tgt), s.id);
+        }
+        d.occupied = pmax >= 0;
+        d.kv_used  = d.occupied ? (int32_t) (pmax + 1) : 0;
+        d.n_ctx    = s.n_ctx;
+
+        if (d.occupied) {
+            const bool has_gpu = g.kv_gpu > 0;
+            const bool has_cpu = g.kv_cpu > 0;
+            d.loc = has_gpu && has_cpu ? kv_loc::kv_mixed
+                  : has_gpu            ? kv_loc::kv_gpu
+                  : has_cpu            ? kv_loc::kv_cpu
+                                      : kv_loc::none;
+        } else {
+            d.loc = kv_loc::none;
+        }
+
+        d.n_prompt        = s.task ? (int32_t) s.task->n_tokens() : (int32_t) s.prompt.n_tokens();
+        d.n_prompt_proc   = (int32_t) s.stats.n_prompt_processed;
+        d.n_prompt_cached = (int32_t) s.stats.n_prompt_cached;
+        d.n_decoded       = (int32_t) s.stats.n_gen;
+        d.n_remain        = s.n_remaining();
+        d.t_last_used     = s.t_last_used;
+        d.idle_age_s      = !s.is_processing() && s.t_last_used > 0
+                          ? (int32_t) ((ggml_time_us() - s.t_last_used) / 1000000) : -1;
+        d.pp_tps          = s.stats.n_prompt_tps();
+        d.tg_tps          = s.stats.n_gen_tps();
+        d.t_prompt_ms     = s.stats.t_prompt_ms();
+        d.t_gen_ms        = s.stats.t_gen_ms();
+
+        // tail: generated tokens, or prompt tail while prefilling
+        std::string tail_text;
+        if (ctx.ctx_tgt) {
+            if (s.generated_tokens.size() > 0) {
+                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(s.generated_tokens, TAIL_TOKENS), true);
+            } else if (s.task) {
+                const llama_tokens & toks = s.prompt.tokens.get_tokens();
+                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(toks, TAIL_TOKENS), true);
+            }
+        }
+        while (!tail_text.empty() && (tail_text.back() == '\n' || tail_text.back() == '\r')) {
+            tail_text.pop_back();
+        }
+        const int tl = (int) std::min((size_t) tail_text.size(), (size_t) TAIL_CHARS - 1);
+        memcpy(d.tail, tail_text.data(), tl);
+        d.tail[tl] = '\0';
+        d.tail_len = tl;
+        n++;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(snap.mtx);
+        snap.global = g;
+        snap.n_slots = n;
+        memcpy(snap.slots, tmp, sizeof(slot_snap) * n);
+        snap.seq++;
+    }
+}
+
+} // namespace tui
