@@ -155,6 +155,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        if (params.printui > 0 && params.tui) {
+            SRV_ERR("%s", "--printui and --tui both write to stdout; use only one\n");
+            return 1;
+        }
+
+        if (params.tui_ratio != -1.0 && (params.tui_ratio <= 0.0 || params.tui_ratio > 10.0)) {
+            SRV_ERR("%s", "--tui-ratio must be in the range (0, 10] or 'auto'\n");
+            return 1;
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
@@ -253,6 +263,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
+    ctx_http.post("/abort",                    ex_wrapper(routes.post_abort));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
@@ -544,7 +555,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_tui();
+        ctx_server.start_printui();
         ctx_server.start_loop();
+        ctx_server.stop_printui();
         ctx_server.stop_tui();
 
         clean_up();

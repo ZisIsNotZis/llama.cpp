@@ -17,38 +17,101 @@
 
 </div>
 
-## This fork: live server dashboard (`--tui`)
+## This fork: three ways to watch your server live
 
-> This fork's differentiator from upstream llama.cpp: a **live, plain-text status stream** built into `llama-server`. No ncurses, no terminal control - just a 1 Hz tagged output that works in any terminal, pipe, or log file.
+> This fork's differentiator from upstream llama.cpp: live per-sequence monitoring built into `llama-server`. Three UIs - a pipe-safe plain-text stream (`--printui N`), a real interactive ncurses terminal UI (`--tui`), and a Dashboard tab in the built-in web UI - all read the **same shared producer** (`dash::feed` + a status snapshot), so they show identical information, just in different shells. Docs: [design](docs/dashboard/DESIGN.md) / [printui](docs/dashboard/IMPLEMENTATION.md) / [web](docs/dashboard/WEB.md).
 
-**What** - every second, `llama-server --tui N` prints an exactly-N-line frame to stdout showing every sequence (phase, KV memory, cache hits, pp/tg speeds, a live tail) plus model identity, memory breakdown, throughput, latency, and real GPU/CPU/disk utilization:
+### 1. Plain-text stream: `--printui N`
 
-```text
-[SERVER] LLaMA 3.2 3B Q8_0 (app)  ctx 32768/128000  split  KV f16/f16  FA on  up 0:31h
-[RUN] busy 3/4  queue 2  engine 78%
-[MEMORY] kv gpu 5.1G  kv cpu 0M  weights 3.6G  cache 512M  rss 4.2G  cells 12.4k/32k
-[THROUGHPUT] prompt 312/s  gen 45.2/s  spec 82%  hit 68%  pp 24ms  tg 22ms  ftok 1.24s
-[GPU] SM 63%  mem 41%  pwr 245W  t 68C  pclk 1.9G  mclk 1.6G  pcie 80M/s
-[SYSTEM] cpu 320%  ioR 45M/s  ioW 1M/s  req q 0.3s pp 1.2s dec 8.4s
-[SEQ 0] PF G kv:##...... len:2048/8192 cch:900 pp:312.4 tg:- q:0.3s dec:136 rem:500 t:100
-Once upon a time in a land far away, there lived a brave knight who traveled across...
-[SEQ 1] DEC G kv:######## len:8123/8192 cch:- pp:- tg:45.2 q:- dec:8123 rem:- t:101
-```
+**What it is** - a timely-output plain-text frame written to stdout every second, exactly `N` lines. No ncurses, no terminal control: it is safe to pipe into a file, `less -R`, or any log collector.
 
-**Why** - upstream `llama-server` logs give no live view of what each sequence is doing, where its KV lives, or whether the GPU is actually busy. This fork fixes that with zero setup: `--tui N` is all you need.
+**Use case** - headless / SSH / cron / CI monitoring; keeping a rolling server log; scripting around live status (grep the tagged lines); terminals without a TTY.
 
-**How**
+**Usage**
 
 ```sh
-llama-server -m model.gguf --tui 30                    # live 30-line frame every second on stdout
-llama-server -m model.gguf --tui 30 2>&1 | less -R     # or pipe it anywhere
-llama-server -m model.gguf --tui 0                     # off (default)
+llama-server -m model.gguf --printui 30                # 30-line frame every second on stdout
+llama-server -m model.gguf --printui 30 2>&1 | less -R # or pipe it anywhere
+llama-server -m model.gguf --printui 0                 # off (default)
 ```
 
-- `N` = total lines per printed frame; each frame is exactly N lines and scrolls the screen up.
-- Tail lines per sequence are allocated evenly from `(N - 7) / n_slots` (the last cell may be longer).
-- Every line is tagged (`[SERVER]`, `[RUN]`, ..., `[SEQ n]`), so it is greppable and parseable.
-- Docs: [design](docs/dashboard/DESIGN.md) / [implementation](docs/dashboard/IMPLEMENTATION.md).
+**Example frame** (model identity; run + throughput + speculative; pp/tg latency + used KV/weights/cache/rss; lifetime totals; GPU/CPU utilization; then one tagged block per sequence with a live tail):
+
+```text
+[SERVER] qwen35 0.8B Q5_K - Medium (app)  ctx 4096/262144  split  KV f16/f16  FA auto  up 2.3h
+[RUN] busy 2/4  queue 1  engine 62%  req 0.8/s  prompt 312/s  gen 45/s  hit 68%
+[MEM] pp 3ms  tg 22ms  ftok 0.41s  kv gpu 0  kv cpu 24MB  weights 580MB  cache 0  rss 1.2GB
+[TOTAL] prompt 120  gen 45  cached 80  decode 51
+[GPU] SM 63%  mem 41%  pwr 245W  t 68C  pclk 1.9G  mclk 1.6G  pcie 80M/s
+[SYSTEM] cpu 320%  ioR 45M/s  ioW 1M/s  req q 0.3s pp 1.2s dec 8.4s
+[SEQ 0] PF G kv:##...... len:2048/8192 cch:900 pp:312 tg:-  q:0.3s dec:136 rem:500 t:100
+Once upon a time in a land far away, there lived a brave knight who...
+[SEQ 1] DEC G kv:######## len:8123/8192 cch:- pp:- tg:45  q:- dec:8123 rem:- t:101
+```
+
+### 2. Interactive terminal UI: `--tui`
+
+**What it is** - a box-drawing (ncurses) dashboard on the alternate screen: a grid of per-sequence cells with live token push, markdown + code highlighting, and full mouse/keyboard control. Resize-aware and smooth (only changed cells are redrawn).
+
+**Use case** - interactive terminal sessions where you want to watch and drive many conversations at once: scroll each sequence, maximize one, type a raw completion straight into a sequence, kill a runaway generation, save a transcript - all without leaving the terminal.
+
+**Usage**
+
+```sh
+llama-server -m model.gguf --tui                    # interactive terminal dashboard (needs a TTY)
+llama-server -m model.gguf --tui --tui-ratio 0.30   # fixed cell aspect (default: auto = terminal aspect)
+```
+
+**Example screen** (global header, then a grid of boxed sequences, then the status bar):
+
+```text
+┌ qwen35 0.8B Q5_K - Medium (app)  ctx 4096/262144  split  KV f16/f16  FA auto ┐
+│ busy 2/4  queue 1  engine 62%  req 0.8/s  prompt 312/s  gen 45/s  hit 68%   │
+│ pp 3ms  tg 22ms  ftok 0.41s  kv gpu 0  kv cpu 24MB  weights 580MB  rss 1.2GB  │
+│ total prompt 120  gen 45  cached 80  decode 51  ratio 0.21                    │
+┌─────────────────────────────────┐┌────────────────────────────────┐
+│ SEQ 2 DEC  kv:300/1024 pp:- tg:45││ SEQ 3 PF   kv:20/1024 pp:312 tg:-│
+│ The knight rode onward through  ││ The user asks about the server  │
+│ the misty valley, and...        ││ status while the prompt loads... │
+└─────────────────────────────────┘└────────────────────────────────┘
+llama-server  [q] detach  [L/R] select  [↑/↓] scroll  [[/]] ratio  [i] input  [k] kill  [s] save
+```
+
+**Controls**
+
+| Key / mouse | Action |
+|---|---|
+| mouse wheel | scroll the cell under the cursor (pinned at the bottom auto-follows; scroll up holds) |
+| click / double-click | select / maximize + restore a sequence |
+| `Left`/`Right` | move selection |
+| `Up`/`Down` | scroll the selected cell |
+| `Enter` | maximize / restore |
+| `[` / `]` | tune the grid cell aspect ratio live (shown in the header) |
+| `i` | open the bottom input bar: type a raw completion, `Enter` sends it to that sequence, `Shift+Enter` newline, `Esc` cancels |
+| `k` | abort the selected sequence's running completion (ends cleanly like end-of-stream, client gets the partial text) |
+| `s` | save the selected sequence's text to `yymmddhhmmss.txt` |
+| `q` | detach the TUI (server keeps running) |
+| `Ctrl-C` | stop the server |
+
+### 3. Web dashboard (built-in web UI)
+
+**What it is** - a Dashboard tab in the built-in web UI, **on by default** (no switch). It is the same UI/UX as the ncurses TUI, rendered in the browser: same global header, same HxW grid (same `grid_dims` objective, auto ratio), same per-sequence text with live push and scroll-follow, same bottom input bar, per-cell kill, and `[`/`]` ratio tuning. Cached/evicted sequences appear in a flat list.
+
+**Use case** - when a browser is more convenient than a terminal: check on the server from anywhere, drive it from the phone/desktop, and keep the exact same mental model as `--tui`.
+
+**Usage**
+
+```sh
+llama-server -m model.gguf                # web UI (with dashboard tab) is on by default
+# open http://127.0.0.1:8080/dashboard
+```
+
+**Example** - the dashboard mirrors the terminal screens above: header rows (model / run+throughput / memory / totals+ratio), then a grid of `[SEQ n]` cells each with a scrollable live text area, a `kill` button while a sequence is generating, and the bottom input bar for firing raw completions into the selected sequence.
+
+### Notes
+
+- `--printui` and `--tui` both write stdout, so they cannot be used together (startup error). The web dashboard has no such restriction.
+- All three share one producer: the same sequence feed and status snapshot drive printui, the ncurses TUI, and the SSE-backed web dashboard, so the numbers always agree.
 
 ## Quick start
 
@@ -95,7 +158,7 @@ a wide range of hardware - locally and in the cloud.
 - Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
 - Vulkan and SYCL backend support
 - CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
-- Live status stream for `llama-server` (`--tui N`): prints a tagged frame every second with all sequences (phase, KV memory, cache hits, speeds, live tail) plus memory/throughput/GPU utilization; N = lines per frame, 0 = off.
+- Three live server monitors for `llama-server`, all sharing one producer: a pipe-safe plain-text stream (`--printui N`, N = lines per frame, 0 = off) with tagged per-sequence blocks plus memory/throughput/GPU utilization; an interactive ncurses terminal dashboard (`--tui`) with mouse/keyboard, per-sequence scroll + maximize, a raw-completion input bar, and `k` to abort a generation; and a Dashboard tab in the built-in web UI that mirrors the ncurses TUI.
 
 The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
 

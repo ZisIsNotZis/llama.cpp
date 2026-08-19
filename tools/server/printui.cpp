@@ -1,4 +1,4 @@
-#include "tui.h"
+#include "printui.h"
 
 #include <algorithm>
 #include <chrono>
@@ -15,7 +15,7 @@
 #include <unistd.h>
 #endif
 
-namespace tui {
+namespace printui {
 
 static std::string bytes(size_t b) {
     static const char * unit[] = {"B", "kB", "MB", "GB", "TB"};
@@ -445,7 +445,7 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
                                       const ext_snap & ext) {
     std::vector<std::string> L;
 
-    // 6 fixed tagged lines
+    // 4 core header lines mirror the ncurses TUI dashboard (same info, plain text)
     {
         std::string ctx = fstr((double) g.n_ctx, 0) + "/" + fstr((double) g.n_ctx_train, 0);
         L.push_back("[SERVER] " + std::string(g.model_desc) + " (" + std::string(g.alias) + ")  ctx " + ctx
@@ -453,29 +453,29 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
                   + "  FA " + std::string(g.flash_attn)
                   + "  up " + fstr((double) g.uptime_s / 3600.0, 1) + "h");
     }
-    L.push_back("[RUN] busy " + fint(g.busy) + "/" + fint(g.n_slots)
-              + "  queue " + fint(g.deferred) + "  engine " + fint((long long) (g.engine_busy * 100.0 + 0.5)) + "%");
     {
-        size_t used_cells = 0;
-        size_t resv_cells = 0;
-        for (const auto & s : slots) {
-            used_cells += (size_t) std::max(0, s.kv_used);
-            if (g.kv_unified) {
-                resv_cells = g.n_ctx;
-            } else {
-                resv_cells += (size_t) std::max(0, s.n_ctx);
-            }
+        std::string r = "[RUN] busy " + fint(g.busy) + "/" + fint(g.n_slots)
+                      + "  queue " + fint(g.deferred) + "  engine " + fint((long long) (g.engine_busy * 100.0 + 0.5)) + "%"
+                      + "  req " + (g.total_requests > 0 ? fstr(g.req_per_s, 1) + "/s" : std::string("-"))
+                      + "  prompt " + fstr(g.prompt_tps, 0) + "/s  gen " + fstr(g.gen_tps, 0) + "/s"
+                      + "  hit "  + (g.hit_rate >= 0 ? fstr(g.hit_rate * 100.0, 0) + "%" : "-");
+        if (g.speculative) {
+            r += "  spec acc " + (g.spec_acc >= 0 ? fstr(g.spec_acc * 100.0, 0) + "%" : "-")
+               + " len " + (g.spec_acc_len > 0 ? fstr(g.spec_acc_len, 1) : "-")
+               + "/" + (g.spec_prop_len > 0 ? fstr(g.spec_prop_len, 1) : "-");
         }
-        L.push_back("[MEMORY] kv gpu " + bytes(g.kv_gpu) + "  kv cpu " + bytes(g.kv_cpu)
-                  + "  weights " + bytes(g.weights_gpu) + "  cache " + bytes(g.ram_cache)
-                  + "  rss " + bytes(g.rss) + "  cells " + fint(used_cells) + "/" + fint(resv_cells));
+        L.push_back(r);
     }
-    L.push_back("[THROUGHPUT] prompt " + fstr(g.prompt_tps, 0) + "/s  gen " + fstr(g.gen_tps, 0) + "/s"
-              + "  req " + (g.total_requests > 0 ? fstr(g.req_per_s, 1) + "/s" : std::string("-"))
-              + "  spec " + (g.spec_acc >= 0 ? fstr(g.spec_acc * 100.0, 0) + "%" : "-")
-              + "  hit "  + (g.hit_rate >= 0 ? fstr(g.hit_rate * 100.0, 0) + "%" : "-")
-              + "  pp " + fstr(g.pp_ms_tok, 0) + "ms  tg " + fstr(g.tg_ms_tok, 0) + "ms  ftok "
-              + (g.first_tok_s > 0 ? fstr(g.first_tok_s, 2) + "s" : "-"));
+    {
+        std::string m = "[MEM] pp " + fstr(g.pp_ms_tok, 0) + "ms  tg " + fstr(g.tg_ms_tok, 0) + "ms  ftok "
+                      + (g.first_tok_s > 0 ? fstr(g.first_tok_s, 2) + "s" : "-")
+                      + "  kv gpu " + bytes(g.kv_gpu_used) + "  kv cpu " + bytes(g.kv_cpu_used)
+                      + "  weights " + bytes(g.weights_gpu + g.weights_cpu)
+                      + "  cache " + bytes(g.ram_cache) + "  rss " + bytes(g.rss);
+        L.push_back(m);
+    }
+    L.push_back("[TOTAL] prompt " + fint((long long) g.total_prompt) + "  gen " + fint((long long) g.total_gen)
+              + "  cached " + fint((long long) g.total_cached) + "  decode " + fint((long long) g.total_decode));
     if (ext.gpu_avail) {
         std::string pcie = ext.pcie_avail ? fstr(ext.pcie_rx, 0) + "M/s" : "-";
         std::string multi = ext.gpu_count > 1 ? ("x" + fint(ext.gpu_count) + "  ") : "";
@@ -494,10 +494,6 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
                         : "phases -";
         L.push_back("[SYSTEM] cpu " + cpu + "  ioR " + ior + "  ioW " + iow + "  req " + req);
     }
-
-    // cumulative lifetime counters
-    L.push_back("[TOTAL] prompt " + fint((long long) g.total_prompt) + "  gen " + fint((long long) g.total_gen)
-              + "  cached " + fint((long long) g.total_cached) + "  decode " + fint((long long) g.total_decode));
 
     // per-sequence blocks (allocation computed on the engine thread)
     const int n     = (int) slots.size();
@@ -530,4 +526,27 @@ std::vector<std::string> format_frame(const global_snap & g, const std::vector<s
     return L;
 }
 
-} // namespace tui
+// shared grid layout: minimize log-space loss (see printui.h)
+void grid_dims(int n, int rows, int cols, double ratio, int & H, int & W) {
+    H = W = 1;
+    if (n <= 0) {
+        return;
+    }
+    const double target = ratio * (double) std::max(1, cols) / (double) std::max(1, rows);
+    const int MIN_W = 20; // minimum cell width in columns
+    const int maxW = std::max(1, cols / MIN_W);
+    double best = 1e18;
+    for (int w = 1; w <= std::min(n, maxW); w++) {
+        const int h = (n + w - 1) / w;
+        const double dev = std::abs(std::log((double) w / (double) h) - std::log(target));
+        const int empty = h * w - n;
+        const double score = dev + 0.3 * std::log(1.0 + (double) empty);
+        if (score < best) {
+            best = score;
+            W = w;
+            H = h;
+        }
+    }
+}
+
+} // namespace printui

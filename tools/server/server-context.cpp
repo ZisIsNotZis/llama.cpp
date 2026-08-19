@@ -7,7 +7,8 @@
 #include "server-schema.h"
 #include "server-stream.h"
 
-#include "tui.h"
+#include "printui.h"
+#include "nctui.h"
 #include "server-dash.h"
 #include "src/llama-ext.h"
 
@@ -48,7 +49,7 @@
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 // wall-clock epoch microseconds (for dashboard sequence timestamps)
-static int64_t tui_now_epoch_us() {
+static int64_t printui_now_epoch_us() {
     return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -333,8 +334,8 @@ struct server_slot {
         if (cur == nullptr) {
             return false;
         }
-        cur->t_created  = dash_t_created != 0 ? dash_t_created : tui_now_epoch_us();
-        cur->t_modified = tui_now_epoch_us();
+        cur->t_created  = dash_t_created != 0 ? dash_t_created : printui_now_epoch_us();
+        cur->t_modified = printui_now_epoch_us();
         cur->hit_rate   = dash_hit_rate;
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -860,7 +861,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 
 struct server_context_impl {
     friend struct server_context;
-    friend void tui::fill_snapshot(tui::snapshot & snap, server_context_impl & ctx);
+    friend void printui::fill_snapshot(printui::snapshot & snap, server_context_impl & ctx);
 
 public:
     // only use these pointers outside of this class:
@@ -882,8 +883,14 @@ public:
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
     // TUI dashboard lifecycle (see docs/dashboard)
+    void start_printui();
+    void stop_printui();
     void start_tui();
     void stop_tui();
+
+    // TUI hooks (fire & forget, in-process)
+    void tui_submit_completion(int id_slot, const std::string & prompt);
+    void tui_kill_slot(int id_slot);
 
     // shared sequence feed (web dashboard, see docs/dashboard/WEB.md)
     dash::feed & get_dash_feed() {
@@ -891,8 +898,8 @@ public:
     }
 
     // status snapshot (global + per-slot), shared with the TUI
-    tui::snapshot & get_tui_snapshot() {
-        return tui_snap;
+    printui::snapshot & get_snapshot() {
+        return printui_snap;
     }
 
     server_context_impl() {
@@ -979,11 +986,14 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     // TUI dashboard
-    tui::snapshot  tui_snap;
-    tui::controller tui_ctl { tui_snap };
+    printui::snapshot  printui_snap;
+    printui::controller printui_ctl { printui_snap };
 
     // shared sequence feed (web dashboard + TUI)
     dash::feed dash_feed;
+
+    // interactive terminal dashboard (--tui)
+    nctui::controller nctui_ctl { dash_feed, printui_snap };
 
     // engine busy tracking (rolling window over update_slots time)
     int64_t engine_busy_us       = 0;
@@ -991,7 +1001,7 @@ private:
     int64_t engine_ring_busy[64] = {0};
     int     engine_ring_head     = 0;
     int     engine_ring_n        = 0;
-    int64_t tui_last_publish_us  = 0;
+    int64_t printui_last_publish_us  = 0;
 
     // TUI request-rate ring
     int64_t  req_ring_t[64]      = {0};
@@ -1000,15 +1010,21 @@ private:
     int      req_ring_n_samples  = 0;
 
     // TUI per-slot sliding-window speed history (32 samples each)
-    int64_t  slot_hist_t[tui::MAX_SLOTS][32]   = {{0}};
-    int32_t  slot_hist_pp[tui::MAX_SLOTS][32]  = {{0}};
-    int32_t  slot_hist_dec[tui::MAX_SLOTS][32] = {{0}};
-    int      slot_hist_head[tui::MAX_SLOTS]    = {0};
-    int      slot_hist_n[tui::MAX_SLOTS]       = {0};
+    int64_t  slot_hist_t[printui::MAX_SLOTS][32]   = {{0}};
+    int32_t  slot_hist_pp[printui::MAX_SLOTS][32]  = {{0}};
+    int32_t  slot_hist_dec[printui::MAX_SLOTS][32] = {{0}};
+    int      slot_hist_head[printui::MAX_SLOTS]    = {0};
+    int      slot_hist_n[printui::MAX_SLOTS]       = {0};
+
+    // global realtime sample ring for tg speed (time, cumulative gen token count)
+    int64_t  ghist_t[64]   = {{0}};
+    uint64_t ghist_gen[64] = {{0}};
+    int      ghist_head    = 0;
+    int      ghist_n       = 0;
 
     void engine_busy_sample(int64_t dt_us, int64_t t_us);
     double engine_busy_ratio(int64_t now_us);
-    void tui_publish();
+    void printui_publish();
     void dash_publish();
 
     void destroy() {
@@ -1044,8 +1060,8 @@ private:
         }
         sleeping = new_state;
         // publish immediately (bypass the 10 Hz throttle) so the frame shows SLEEP/RUN
-        if (tui_ctl.is_active()) {
-            tui::fill_snapshot(tui_snap, *this);
+        if (printui_ctl.is_active()) {
+            printui::fill_snapshot(printui_snap, *this);
         }
     }
 
@@ -1494,7 +1510,7 @@ private:
             const int64_t t1 = ggml_time_us();
             engine_busy_sample(t1 - t0, t1);
             dash_publish();
-            tui_publish();
+            printui_publish();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2511,9 +2527,16 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
-                    // release slot linked with the task id
+                    // end the completion gracefully: send the final response (the text
+                    // generated so far) so the HTTP client connection completes cleanly,
+                    // then release the slot - same as a stop token / end of stream
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            if (slot.is_processing()) {
+                                slot.stop = STOP_TYPE_ABORT;
+                                slot.print_timings();
+                                send_final_response(slot);
+                            }
                             slot.release();
                             break;
                         }
@@ -4228,6 +4251,14 @@ void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
 
+void server_context::start_printui() {
+    impl->start_printui();
+}
+
+void server_context::stop_printui() {
+    impl->stop_printui();
+}
+
 void server_context::start_tui() {
     impl->start_tui();
 }
@@ -4236,12 +4267,16 @@ void server_context::stop_tui() {
     impl->stop_tui();
 }
 
+void server_context::abort_slot(int id_slot) {
+    impl->tui_kill_slot(id_slot);
+}
+
 dash::feed & server_context::get_dash_feed() {
     return impl->get_dash_feed();
 }
 
-tui::snapshot & server_context::get_tui_snapshot() {
-    return impl->get_tui_snapshot();
+printui::snapshot & server_context::get_snapshot() {
+    return impl->get_snapshot();
 }
 
 llama_context * server_context::get_llama_context() const {
@@ -4750,14 +4785,14 @@ void server_routes::init_routes() {
         res->headers["X-Accel-Buffering"] = "no";
 
         dash::feed & feed = ctx_server.get_dash_feed();
-        tui::snapshot & snap = ctx_server.get_tui_snapshot();
+        printui::snapshot & snap = ctx_server.get_snapshot();
         auto cursor_ptr = std::make_shared<uint64_t>(feed.subscribe());
         auto sent_ptr   = std::make_shared<bool>(false);
         auto last_status = std::make_shared<int64_t>(0);
 
         auto global_to_json = [&]() {
             std::lock_guard<std::mutex> lk(snap.mtx);
-            const tui::global_snap & g = snap.global;
+            const printui::global_snap & g = snap.global;
             return json {
                 {"model", g.model_desc}, {"alias", g.alias},
                 {"ctx", g.n_ctx}, {"ctx_train", g.n_ctx_train}, {"slots", g.n_slots},
@@ -4783,10 +4818,10 @@ void server_routes::init_routes() {
             const char * ph = "IDL";
             const char * loc = "-";
             for (int i = 0; i < snap.n_slots; i++) {
-                const tui::slot_snap & s = snap.slots[i];
-                ph = s.ph == tui::phase::prefill ? "PF" : s.ph == tui::phase::decode ? "DEC" : "IDL";
-                loc = s.loc == tui::kv_loc::kv_gpu ? "G" : s.loc == tui::kv_loc::kv_cpu ? "C"
-                    : s.loc == tui::kv_loc::kv_mixed ? "M" : s.loc == tui::kv_loc::ram_cache ? "R" : "-";
+                const printui::slot_snap & s = snap.slots[i];
+                ph = s.ph == printui::phase::prefill ? "PF" : s.ph == printui::phase::decode ? "DEC" : "IDL";
+                loc = s.loc == printui::kv_loc::kv_gpu ? "G" : s.loc == printui::kv_loc::kv_cpu ? "C"
+                    : s.loc == printui::kv_loc::kv_mixed ? "M" : s.loc == printui::kv_loc::ram_cache ? "R" : "-";
                 arr.push_back({
                     {"id", s.id}, {"phase", ph}, {"loc", loc}, {"occupied", s.occupied},
                     {"kv_used", s.kv_used}, {"n_ctx", s.n_ctx},
@@ -5126,6 +5161,19 @@ void server_routes::init_routes() {
             body,
             files,
             TASK_RESPONSE_TYPE_NONE);
+    };
+
+    this->post_abort = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const int id_slot = json_value(body, "slot_id", -1);
+        if (id_slot < 0) {
+            res->error(format_error_response("missing slot_id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        ctx_server.tui_kill_slot(id_slot);
+        res->ok(json{{ "aborted", id_slot }});
+        return res;
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
@@ -5774,14 +5822,14 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 // TUI dashboard (see docs/dashboard)
 //
 
-static llama_tokens tui_last_tokens(const llama_tokens & toks, size_t k) {
+static llama_tokens printui_last_tokens(const llama_tokens & toks, size_t k) {
     if (toks.size() <= k) {
         return toks;
     }
     return llama_tokens(toks.end() - k, toks.end());
 }
 
-static size_t tui_rss_bytes() {
+static size_t printui_rss_bytes() {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     std::ifstream f("/proc/self/statm");
     if (f) {
@@ -5834,31 +5882,31 @@ double server_context_impl::engine_busy_ratio(int64_t now_us) {
     return std::min(1.0, (double) busy / (double) elapsed);
 }
 
-void server_context_impl::tui_publish() {
-    if (!tui_ctl.is_active()) {
+void server_context_impl::printui_publish() {
+    if (!printui_ctl.is_active()) {
         return;
     }
     const int64_t now = ggml_time_us();
-    if (now - tui_last_publish_us < 100 * 1000) {
+    if (now - printui_last_publish_us < 100 * 1000) {
         return; // throttle to 10 Hz
     }
-    tui_last_publish_us = now;
-    tui::fill_snapshot(tui_snap, *this);
+    printui_last_publish_us = now;
+    printui::fill_snapshot(printui_snap, *this);
 }
 
 void server_context_impl::dash_publish() {
     if (!ctx_tgt) {
         return;
     }
-    // status snapshot (global + per-slot), ~5 Hz, regardless of --tui
+    // status snapshot (global + per-slot), ~5 Hz, regardless of --printui
     {
         const int64_t t = ggml_time_us();
-        if (t - tui_last_publish_us >= 200 * 1000) {
-            tui_last_publish_us = t;
-            tui::fill_snapshot(tui_snap, *this);
+        if (t - printui_last_publish_us >= 200 * 1000) {
+            printui_last_publish_us = t;
+            printui::fill_snapshot(printui_snap, *this);
         }
     }
-    const int64_t now = tui_now_epoch_us();
+    const int64_t now = printui_now_epoch_us();
     dash_feed.begin();
     for (auto & slot : slots) {
         const size_t cur = slot.prompt.n_tokens();
@@ -5913,17 +5961,75 @@ void server_context_impl::dash_publish() {
     dash_feed.end();
 }
 
+void server_context_impl::start_printui() {
+    if (params_base.printui > 0) {
+        printui_ctl.start(params_base.printui);
+    }
+}
+
+void server_context_impl::stop_printui() {
+    printui_ctl.stop();
+}
+
 void server_context_impl::start_tui() {
-    if (params_base.tui > 0) {
-        tui_ctl.start(params_base.tui);
+    if (params_base.tui) {
+        nctui::nctui_hooks hooks;
+        hooks.submit_completion = [this](int id_slot, const std::string & prompt) {
+            tui_submit_completion(id_slot, prompt);
+        };
+        hooks.kill_slot = [this](int id_slot) {
+            tui_kill_slot(id_slot);
+        };
+        nctui_ctl.set_hooks(std::move(hooks));
+        nctui_ctl.start(params_base.tui_ratio);
     }
 }
 
 void server_context_impl::stop_tui() {
-    tui_ctl.stop();
+    nctui_ctl.stop();
 }
 
-namespace tui {
+void server_context_impl::tui_submit_completion(int id_slot, const std::string & prompt) {
+    if (!ctx_tgt || prompt.empty()) {
+        return;
+    }
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id     = queue_tasks.get_new_id();
+    task.id_slot = id_slot;
+    // raw completion: tokenize the text as-is (no chat template)
+    llama_tokens toks(prompt.size() + 16);
+    const int n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(),
+                                 toks.data(), (int32_t) toks.size(), false, false);
+    if (n <= 0) {
+        return;
+    }
+    toks.resize((size_t) n);
+    task.tokens = server_tokens(std::move(toks), false);
+    task.params.sampling  = params_base.sampling;
+    task.params.n_predict = params_base.n_predict > 0 ? params_base.n_predict : 512; // cap fire-and-forget
+    task.params.stream        = false;
+    task.params.cache_prompt  = true;
+    task.params.oaicompat_cmpl_id = "tui-" + std::to_string(task.id);
+    std::vector<server_task> v;
+    v.push_back(std::move(task));
+    queue_tasks.post(std::move(v));
+}
+
+void server_context_impl::tui_kill_slot(int id_slot) {
+    for (auto & slot : slots) {
+        if (slot.id == id_slot && slot.task) {
+            server_task task(SERVER_TASK_TYPE_CANCEL);
+            task.id       = queue_tasks.get_new_id();
+            task.id_target = slot.task->id;
+            std::vector<server_task> v;
+            v.push_back(std::move(task));
+            queue_tasks.post(std::move(v), true);
+            return;
+        }
+    }
+}
+
+namespace printui {
 
 void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     global_snap g;
@@ -5969,6 +6075,10 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     g.total_decode = ctx.metrics.n_decode;
 
     // memory breakdown per backend (model / context / compute)
+    // note: g carries over the previous frame above, so the memory fields must
+    // be reset first - otherwise the breakdown accumulates every fill
+    g.kv_cpu = g.weights_cpu = g.compute_cpu = 0;
+    g.kv_gpu = g.weights_gpu = g.compute_gpu = 0;
     if (ctx.ctx_tgt) {
         for (const auto & [buft, data] : llama_get_memory_breakdown(ctx.ctx_tgt)) {
             if (ggml_backend_buft_is_host(buft)) {
@@ -6010,7 +6120,7 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         g.ram_cache     = ctx.prompt_cache->size();
         g.ram_cache_max = ctx.prompt_cache->limit_size;
     }
-    g.rss = tui_rss_bytes();
+    g.rss = printui_rss_bytes();
     g.uptime_s = (ggml_time_us() - ctx.metrics.t_start) / 1000000;
     if (g.uptime_s < 0) {
         g.uptime_s = 0;
@@ -6022,15 +6132,61 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     if (ctx.metrics.n_draft_tokens > 0) {
         g.spec_acc = (double) ctx.metrics.n_draft_accepted / (double) ctx.metrics.n_draft_tokens;
     }
+    if (ctx.metrics.n_draft_verif_steps > 0) {
+        g.spec_prop_len = (double) ctx.metrics.n_draft_tokens / (double) ctx.metrics.n_draft_verif_steps;
+        g.spec_acc_len  = 1.0 + (double) ctx.metrics.n_draft_accepted / (double) ctx.metrics.n_draft_verif_steps;
+    }
     const uint64_t prompt_total = ctx.metrics.prompt.count + ctx.metrics.n_prompt_cached;
     if (prompt_total > 0) {
         g.hit_rate = (double) ctx.metrics.n_prompt_cached / (double) prompt_total;
     }
-    if (ctx.metrics.prompt.count > 0) {
-        g.pp_ms_tok = (double) ctx.metrics.prompt.time / (double) ctx.metrics.prompt.count / 1000.0;
+    // global realtime tg ms/token over a 5 s window (mirrors the per-slot ring).
+    // per-slot n_gen updates every decode step, unlike metrics.predict which only
+    // updates when a task completes. pp uses the prompt bucket rate below because
+    // n_prompt_processed ticks during MTP decode and would pollute the ring.
+    {
+        uint64_t tot_gen = 0;
+        for (const auto & s : ctx.slots) {
+            tot_gen += s.stats.n_gen;
+        }
+        const int64_t now = ggml_time_us();
+        const int h = ctx.ghist_head;
+        ctx.ghist_t[h]   = now;
+        ctx.ghist_gen[h] = tot_gen;
+        ctx.ghist_head   = (h + 1) % 64;
+        if (ctx.ghist_n < 64) {
+            ctx.ghist_n++;
+        }
+        const int64_t want = now - 5 * 1000 * 1000;
+        int64_t  base_t   = 0;
+        uint64_t base_gen = 0;
+        for (int i = 0; i < ctx.ghist_n; i++) {
+            const int idx = (ctx.ghist_head - 1 - i + 64) % 64;
+            if (ctx.ghist_t[idx] <= want) {
+                base_t   = ctx.ghist_t[idx];
+                base_gen = ctx.ghist_gen[idx];
+                break;
+            }
+        }
+        if (base_t == 0 && ctx.ghist_n > 0) {
+            const int idx = (ctx.ghist_head - 1 + 64) % 64;
+            base_t   = ctx.ghist_t[idx];
+            base_gen = ctx.ghist_gen[idx];
+        }
+        const double dt = base_t > 0 ? (now - base_t) / 1e6 : 0.0;
+        if (dt > 0.0) {
+            const double dgen = tot_gen > base_gen ? (double) (tot_gen - base_gen) : 0.0;
+            if (dgen > 0.0) {
+                g.tg_ms_tok = dt * 1000.0 / dgen; // ms per generated token
+                g.gen_tps   = dgen / dt;           // realtime gen tokens/s
+            } else {
+                g.gen_tps = 0.0; // idle: no generation in the window
+            }
+        }
     }
-    if (ctx.metrics.predict.count > 0) {
-        g.tg_ms_tok = (double) ctx.metrics.predict.time / (double) ctx.metrics.predict.count / 1000.0;
+    // pp from the prompt bucket rate (reliable and realtime during the prompt phase)
+    if (g.prompt_tps > 0.0) {
+        g.pp_ms_tok = 1000.0 / g.prompt_tps;
     }
     g.engine_busy = ctx.engine_busy_ratio(ggml_time_us());
 
@@ -6065,10 +6221,10 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         g.req_per_s = dt > 0 ? (nreq - base_n) / dt : 0.0;
     }
 
-    // frame layout: per-slot tail line allocation (--tui N)
+    // frame layout: per-slot tail line allocation (--printui N)
     const int n_slots = (int) std::min(ctx.slots.size(), (size_t) MAX_SLOTS);
-    const tail_alloc_t alloc = tail_alloc(ctx.params_base.tui, n_slots);
-    g.frame_n = std::max(FRAME_MIN, std::min(ctx.params_base.tui, FRAME_MAX));
+    const tail_alloc_t alloc = tail_alloc(ctx.params_base.printui, n_slots);
+    g.frame_n = std::max(FRAME_MIN, std::min(ctx.params_base.printui, FRAME_MAX));
     g.n_shown = alloc.shown;
     // request lifecycle phases of the most recently launched active task
     {
@@ -6193,10 +6349,10 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
         if (ctx.ctx_tgt && d.tail_lines > 0) {
             const int n_tok = std::min(TAIL_TOKENS_MAX, std::max(TAIL_TOKENS_MIN, d.tail_lines * 32));
             if (s.generated_tokens.size() > 0) {
-                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(s.generated_tokens, (size_t) n_tok), true);
+                tail_text = common_detokenize(ctx.ctx_tgt, printui_last_tokens(s.generated_tokens, (size_t) n_tok), true);
             } else if (s.prompt.n_tokens() > 0) {
                 const llama_tokens & toks = s.prompt.tokens.get_tokens();
-                tail_text = common_detokenize(ctx.ctx_tgt, tui_last_tokens(toks, (size_t) n_tok), true);
+                tail_text = common_detokenize(ctx.ctx_tgt, printui_last_tokens(toks, (size_t) n_tok), true);
             }
         }
         while (!tail_text.empty() && (tail_text.back() == '\n' || tail_text.back() == '\r')) {
@@ -6218,4 +6374,4 @@ void fill_snapshot(snapshot & snap, server_context_impl & ctx) {
     }
 }
 
-} // namespace tui
+} // namespace printui

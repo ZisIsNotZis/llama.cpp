@@ -15,7 +15,7 @@
 
 struct server_context_impl;
 
-namespace tui {
+namespace printui {
 
 constexpr int MAX_SLOTS       = 256;  // max parallel slots we handle
 constexpr int TAIL_CHARS      = 8192; // max chars of tail kept per slot (cap)
@@ -23,7 +23,8 @@ constexpr int TAIL_TOKENS_MIN = 64;   // min tail tokens detokenized per slot
 constexpr int TAIL_TOKENS_MAX = 1024; // max tail tokens detokenized per slot
 constexpr int FRAME_MIN       = 9;    // min frame lines (fixed + blank + 1)
 constexpr int FRAME_MAX       = 200;  // max frame lines
-constexpr int FRAME_FIXED     = 8;    // fixed lines: 6 tags + [TOTAL] + blank
+constexpr int FRAME_FIXED     = 7;    // fixed lines: 5 tags + [TOTAL] + blank
+constexpr double TUI_RATIO_DEFAULT = 0.375; // default target cell height:width (30/80)
 
 enum class phase  { idle, prefill, decode };
 enum class kv_loc { none, ram_cache, kv_cpu, kv_gpu, kv_mixed };
@@ -73,6 +74,8 @@ struct global_snap {
     double  prompt_tps  = 0.0;
     double  gen_tps     = 0.0;
     double  spec_acc    = -1.0;
+    double  spec_prop_len = 0.0; // avg draft proposed length (draft tokens / verif steps)
+    double  spec_acc_len  = 0.0; // avg accept length (1 + accepted / verif steps)
     double  hit_rate    = -1.0;
     double  pp_ms_tok   = 0.0;
     double  tg_ms_tok   = 0.0;
@@ -177,4 +180,9 @@ private:
     int64_t   proc_t_prev  = 0;
 };
 
-} // namespace tui
+// shared grid layout: pick H x W minimizing log-space loss.
+// Used by the --tui grid and by the web dashboard (same objective, default ratio).
+// target = ratio x cols / rows; score = |log(W/H) - log(target)| + lambda x log(1 + empty).
+void grid_dims(int n, int rows, int cols, double ratio, int & H, int & W);
+
+} // namespace printui

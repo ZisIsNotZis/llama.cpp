@@ -1,18 +1,18 @@
-# llama-server TUI - Implementation detail
+# llama-server printui - Implementation detail
 
 Status: APPROVED BASELINE
 
 Date: 2026-02-14
 
-This document is the detailed design + implementation for the TUI consumer (plain-text stdout printer). The shared sequence model and event producer live in DESIGN.md (overall design); the web dashboard lives in WEB.md.
+This document is the detailed design + implementation for the printui consumer (plain-text stdout printer). The shared sequence model and event producer live in DESIGN.md (overall design); the web dashboard lives in WEB.md.
 
 ## 1. Scope and relation to DESIGN
 
-- Implements the TUI consumer of the shared producer (DESIGN.md sections 5-7).
+- Implements the printui consumer of the shared producer (DESIGN.md sections 5-7).
 - Fields without a data source render `-` (DESIGN.md section 9).
 - All locked semantics in DESIGN.md section 8.3 are authoritative.
 
-## 2. TUI design
+## 2. printui design
 
 ### 2.1 User experience
 
@@ -44,7 +44,7 @@ The user has just said "hello". I need to respond in a friendly and helpful mann
 
 ### 2.3 Layout rules (line budget)
 
-- `--tui N`: N is the target number of visual rows per frame (default 0 = off).
+- `--printui N`: N is the target number of visual rows per frame (default 0 = off).
 - Frame structure:
   - 7 fixed tagged lines: `[SERVER]`, `[RUN]`, `[MEMORY]`, `[THROUGHPUT]`, `[GPU]`, `[SYSTEM]`, `[TOTAL]`.
   - one block per sequence, in slot order: `[SEQ n]` status line + up to `t_n` tail lines.
@@ -55,7 +55,7 @@ The user has just said "hello". I need to respond in a friendly and helpful mann
 - Tail token budget: `tokens_n ~= t_n x 32`, clamped to `[64, 1024]`, engine-side per slot; the snapshot stores each slot's `tail_lines`.
 - Wrap fix: the printer reads the terminal width, estimates each line's visual rows as `ceil(display_cols / width)` (lines wrap in the terminal), and trims the emitted lines to ~N visual rows (always keeping the 7 fixed lines). Piped (no TTY) -> emit full frame.
 
-### 2.4 Merging and dedup (TUI presentation)
+### 2.4 Merging and dedup (printui presentation)
 
 - Sequence length == KV used cells -> one "kv/len" field.
 - Busy state is conveyed by phase; a single "busy n/m" in `[RUN]`.
@@ -94,16 +94,16 @@ Modified:
 - `tools/server/server-context.cpp/.h` - publish snapshot after `update_slots()` (server-context.cpp:2699); engine-busy timing; `llama_get_memory_breakdown()` data; per-slot `tail_lines` allocation + tail detokenization.
 - `tools/server/server-task.h` - `t_arrival_us` on `server_task`.
 - `tools/server/server-queue.cpp` - stamp `t_arrival_us` in `post()` (queue-wait baseline).
-- `tools/server/server.cpp` - `--tui` wiring; start/stop printer thread around `ctx_server.start_loop()`.
+- `tools/server/server.cpp` - `--printui` wiring; start/stop printer thread around `ctx_server.start_loop()`.
 - `tools/server/server-common.h` - server params field `tui`.
-- `common/arg.cpp`, `common/common.h` - `--tui N` flag and env `LLAMA_ARG_TUI`.
+- `common/arg.cpp`, `common/common.h` - `--printui N` flag and env `LLAMA_ARG_PRINTUI`.
 - `tools/server/server-models.cpp:1028` - move the router `LOG(...)` line to stderr so stdout has no other writer.
 - `tools/server/CMakeLists.txt` - add `tui.cpp`.
 
 ## 5. CLI flag
 
-- `--tui N`: N = total lines per printed frame (exactly), default 0 = off. `--tui 0` / omitted = off (stdout stays empty). Works regardless of TTY (plain text, pipe-safe). Router mode: not applicable, flag is ignored.
-- Env: `LLAMA_ARG_TUI` (int).
+- `--printui N`: N = total lines per printed frame (exactly), default 0 = off. `--printui 0` / omitted = off (stdout stays empty). Works regardless of TTY (plain text, pipe-safe). Router mode: not applicable, flag is ignored.
+- Env: `LLAMA_ARG_PRINTUI` (int).
 
 ## 6. Logging stream changes
 
@@ -220,9 +220,9 @@ As of the initial implementation, all S1 rows below are wired into the snapshot 
 | ram_cache | `prompt_cache->size()` and limit (server-task.h:592) | S1 | available |
 | rss | Linux: `/proc/self/statm` (or `getrusage` peak fallback); else 0 | S1 | Linux only |
 | uptime | `metrics.t_start` vs now | S1 | available |
-| GPU SM/mem/temp/pwr/clocks | `nvidia-smi --query-gpu=...` one-shot subprocess on the TUI thread (tui.cpp) | N | implemented (Linux) |
+| GPU SM/mem/temp/pwr/clocks | `nvidia-smi --query-gpu=...` one-shot subprocess on the printui thread (tui.cpp) | N | implemented (Linux) |
 | pcie rx/tx | `nvidia-smi --query-gpu=pcie.rx_bytes,pcie.tx_bytes` (separate probe; not on all drivers) | N | implemented (falls back to `-`) |
-| cpu% | `/proc/self/stat` utime+stime deltas on the TUI thread | N | implemented (Linux) |
+| cpu% | `/proc/self/stat` utime+stime deltas on the printui thread | N | implemented (Linux) |
 | ioR/ioW | `/proc/self/io` read_bytes/write_bytes deltas | N | implemented (Linux) |
 | req lifecycle phases | `server_task.t_arrival_us` (stamped in `server_queue::post()`) + `slot.stats.t_start` -> queue wait; prefill/decode from slot stats; shown for the latest active task | N | implemented |
 | lifetime counters | `server_metrics.prompt.count / predict.count / n_prompt_cached / n_decode` -> `[TOTAL]` line | B | implemented |
@@ -272,32 +272,34 @@ None. The printer thread only does `fwrite`/`fflush(stdout)`. No alt-screen, no 
 
 ## 12. Build integration
 
-- Add `tui.cpp` to the `server-context` target in `tools/server/CMakeLists.txt` (it needs access to `server_slot`, `server_metrics`, `prompt_cache`, and `llama_ext`).
+- Add `printui.cpp`, `nctui.cpp`, and `markup.cpp` to the `server-context` target in `tools/server/CMakeLists.txt` (they need access to `server_slot`, `server_metrics`, `prompt_cache`, and `llama_ext`).
 - Include `src/llama-ext.h` (already reachable via the target's `${CMAKE_SOURCE_DIR}` include dir; common/ already uses it) to get `llama_get_memory_breakdown`.
-- No new link dependencies; std::thread already used.
+- New link dependencies (only pulled when the server is built): ncursesw (via `pkg_check_modules(NCURSESW ncursesw)`) for the `--tui` dashboard, and md4c (vendored `third_party/md4c/md4c.h`, MIT; linked via `find_library` with a `libmd4c.so.0` fallback for systems without the dev symlink) for markdown parsing. Both are optional at runtime: `--tui` requires a TTY; `--tui-ratio` is ignored unless `--tui`.
 
 ## 13. Testing / validation
 
-- `--tui` absent or `0`: stdout stays empty, behavior unchanged (piped to file).
-- `--tui N` piped to a file: each frame is exactly N lines (verify with `wc -l` across frames), tags present, blank separator line between frames.
+- `--tui` (ncurses): verified with a pty harness + minimal ANSI decoder (screen-state reconstruction): wheel scroll -> right-edge indicator, double-click maximize -> 1 box, Enter restore, Up-arrow scroll, q detach while the server keeps serving. Syntax colors confirmed as SGR codes in the raw stream. `markup::parse` unit-dumped (headings bold, inline bold/italic/code, blockquote, python/c keywords/strings/numbers/comments, malformed-code plain fallback).
+
+- `--printui` absent or `0`: stdout stays empty, behavior unchanged (piped to file).
+- `--printui N` piped to a file: each frame is exactly N lines (verify with `wc -l` across frames), tags present, blank separator line between frames.
 - Multi-slot: send concurrent completions (2-8 slots), verify `[SEQ n]` blocks, phase transitions, idle notes, `busy n/m`, `queue`, `[SKIP]` when N too small.
 - Unified vs split: run both, verify kv/len semantics (split per-slot reserved, unified shared occupancy) and loc G/C/R/- behavior.
 - Tail: multi-line chat content stays aligned (newline-split), tail lines blank-pad to `t_i`.
 - Cache: repeat a prompt prefix, verify `cch` and `hit%` increase.
 - Spec: run with `-sp`, verify `spec acc`.
 - Memory: verify kv gpu/cpu, weights, cache, rss against a known config; cross-check with `nvidia-smi` and `/proc` when available.
-- Impact: run a fixed benchmark with and without `--tui`, confirm engine throughput delta is within noise.
+- Impact: run a fixed benchmark with and without `--printui`, confirm engine throughput delta is within noise.
 
 ## 14. Risks and notes
 
 - The engine thread publishes under a mutex at <= 10 Hz; if profiling shows measurable impact, reduce publish rate.
 - `src/llama-ext.h` is a staging header ("try as much as possible to not include in the rest of the codebase"). Using it from the server is acceptable for a personal fork but should be isolated in one place (server-context), not spread around.
 - The router LOG->stderr change is the only stdout behavior change and only affects router mode.
-- stdout is a live stream; when `--tui N` is set the server writes N lines/second to stdout, so consumers should pipe to a file or `less`.
+- stdout is a live stream; when `--printui N` is set the server writes N lines/second to stdout, so consumers should pipe to a file or `less`.
 
 ## 15. Implementation checklist
 
-1. `--tui N` (int) in common_params + arg + server wiring.
+1. `--printui N` (int) in common_params + arg + server wiring.
 2. Move router LOG to stderr; verify stdout empty when `tui == 0`.
 3. Snapshot types + publish hook in `update_slots()` (throttled) + engine-busy timing.
 4. Printer thread lifecycle + 1 Hz loop (no terminal control).
@@ -311,14 +313,14 @@ None. The printer thread only does `fwrite`/`fflush(stdout)`. No alt-screen, no 
 | Date | Change | Approved by |
 |---|---|---|
 | 2026-02-14 | Initial baseline | owner |
-| 2026-02-14 | Initial implementation: snapshot struct, publish hook, controller, renderer, `--tui` flag, router LOG->stderr, `tui.cpp`/`tui.h`. S1 fields implemented; N/B placeholders. | owner |
-| 2026-02-14 | Tier N (partial): GPU panel via `nvidia-smi` (SM/mem/temp/pwr/clocks, pcie fallback) and SYSTEM panel via `/proc` (process CPU%, disk IO rates), read on the TUI thread into `ext_snap`. | owner |
+| 2026-02-14 | Initial implementation: snapshot struct, publish hook, controller, renderer, `--printui` flag, router LOG->stderr, `tui.cpp`/`tui.h`. S1 fields implemented; N/B placeholders. | owner |
+| 2026-02-14 | Tier N (partial): GPU panel via `nvidia-smi` (SM/mem/temp/pwr/clocks, pcie fallback) and SYSTEM panel via `/proc` (process CPU%, disk IO rates), read on the printui thread into `ext_snap`. | owner |
 | 2026-02-14 | Tier N complete: request lifecycle phases (`req q Xs pp Xs dec Xs`) via `server_task.t_arrival_us` stamped in `server_queue::post()`. | owner |
 | 2026-02-14 | Design change (open questions): always ASCII; tails shown for all sequences in any state; tail window full-width with evenly shared height; tail token budget proportional to window area (TUI writes `tail_tokens_hint` into the snapshot). | owner |
 | 2026-02-14 | Tail box fix: split tail text on newlines, wrap each logical line, sanitize control chars so the box stays aligned with multi-line chat content. | owner |
 | 2026-02-14 | Design change: drop the `...` truncation marker (broke alignment); SEQUENCES uses inline `k:v` summary labels instead of a far-away table header (column header row removed, fixed band now 10 rows). | owner |
-| 2026-02-14 | Major redesign: plain-text timely-output program. `--tui N` = exact lines per frame; tagged lines (`[SERVER]`/`[RUN]`/.../`[SEQ n]`); no terminal control/width/ncurses; per-slot `tail_lines` computed on the engine thread; tail token budget `~ t x 32`; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:`; trailing blank frame separator. | owner |
+| 2026-02-14 | Major redesign: plain-text timely-output program. `--printui N` = exact lines per frame; tagged lines (`[SERVER]`/`[RUN]`/.../`[SEQ n]`); no terminal control/width/ncurses; per-slot `tail_lines` computed on the engine thread; tail token budget `~ t x 32`; `[SEQ]` gains `q:`/`dec:`/`rem:`/`t:`; trailing blank frame separator. | owner |
 | 2026-02-14 | Tier B (partial): `[TOTAL]` lifetime counters line; `[SERVER]` KV cache types via `llama_get_kv_cache_types()` (new llama-ext API); snapshot publishes on sleep-state change (model info carried over, no more stale `[RUN]` while sleeping). | owner |
 | 2026-02-14 | Bug fix: one concatenated single-write frame (no jitter); terminal width at boot used to estimate per-line visual rows (lines wrap in the terminal) and trim the frame to ~N visual rows; no manual wrapping. | owner |
 | 2026-02-14 | Tier B complete: `req/s` (task counter + rate ring), sliding-window per-slot `pp5:`/`tg5:` speeds, per-slot RAM-cache `R` attribution (`server_prompt_cache_state.id_slot`), multi-GPU `[GPU]` (all nvidia-smi lines, summed power, `xN`). | owner |
-| 2026-02-14 | Restructured: this doc is now the TUI detail; the shared sequence model/event producer moved to DESIGN.md (overall); the web dashboard lives in WEB.md. | owner |
+| 2026-02-14 | Restructured: this doc is now the printui detail; the shared sequence model/event producer moved to DESIGN.md (overall); the web dashboard lives in WEB.md. | owner |
