@@ -45,6 +45,7 @@ enum stop_type {
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
+    STOP_TYPE_ABORT,
 };
 
 struct task_params {
@@ -368,6 +369,12 @@ struct server_task_result_cmpl_final : server_task_result {
     virtual void update(task_result_state & state) override {
         is_updated = true;
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+
+        // on abort the chat re-parse may drop the partial text; keep the raw
+        // generated text so the client still receives what was produced so far
+        if (stop == STOP_TYPE_ABORT && oaicompat_msg.content.empty()) {
+            oaicompat_msg.content = content;
+        }
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

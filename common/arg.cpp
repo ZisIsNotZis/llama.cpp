@@ -1727,12 +1727,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--tui"}, "N",
-        string_format("print a live tagged status frame to stdout every second; N = total lines per frame, 0 = off (default: %d)", params.tui),
+        {"--printui"}, "N",
+        string_format("print a live tagged status frame to stdout every second; N = total lines per frame, 0 = off (default: %d)", params.printui),
         [](common_params & params, int value) {
+            params.printui = value;
+        }
+    ).set_env("LLAMA_ARG_PRINTUI").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tui"},
+        {"--no-tui"},
+        string_format("show the interactive ncurses terminal dashboard (requires a TTY, cannot be combined with --printui; default: %s)", params.tui ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
             params.tui = value;
         }
     ).set_env("LLAMA_ARG_TUI").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tui-ratio"}, "R",
+        "target cell height:width for the --tui grid; '['/']' tune it live; auto adapts to the terminal aspect at start (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.tui_ratio = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_TUI_RATIO").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},

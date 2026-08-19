@@ -4,7 +4,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-dash.h"
-#include "tui.h"
+#include "printui.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -99,14 +99,22 @@ struct server_context {
     void terminate();
 
     // TUI dashboard (see docs/dashboard): opt-in, stdout only when a tty
+    void start_printui();
+    void stop_printui();
+
+    // interactive ncurses terminal dashboard (--tui), opt-in
     void start_tui();
     void stop_tui();
+
+    // abort the running completion in a slot (graceful stop; the HTTP client
+    // connection finishes like an end-of-stream). Used by the TUI `k` and /abort.
+    void abort_slot(int id_slot);
 
     // shared sequence feed for the web dashboard (see docs/dashboard/WEB.md)
     dash::feed & get_dash_feed();
 
     // status snapshot (global + per-slot), shared with the TUI
-    tui::snapshot & get_tui_snapshot();
+    printui::snapshot & get_snapshot();
 
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
@@ -149,6 +157,7 @@ struct server_routes {
     server_http_context::handler_t post_infill;
     server_http_context::handler_t post_completions;
     server_http_context::handler_t post_completions_oai;
+    server_http_context::handler_t post_abort;
     server_http_context::handler_t post_chat_completions;
     server_http_context::handler_t post_chat_completions_tok;
     server_http_context::handler_t post_control;

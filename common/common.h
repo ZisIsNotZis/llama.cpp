@@ -610,7 +610,9 @@ struct common_params {
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
-    int     tui                 = 0;     // --tui N: lines per printed frame to stdout, 0 = off
+    int     printui             = 0;     // --printui N: lines per printed frame to stdout, 0 = off
+    bool    tui                 = false; // --tui: interactive ncurses terminal dashboard
+    double  tui_ratio           = -1.0;  // --tui-ratio R: target cell height:width; -1 = auto (terminal aspect at TUI start)
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.

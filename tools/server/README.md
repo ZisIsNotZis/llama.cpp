@@ -217,7 +217,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
-| `--tui N` | print a live tagged status frame to stdout every second; N = total lines per frame, 0 = off (default: 0)<br/>(env: LLAMA_ARG_TUI) |
+| `--printui N` | print a live tagged status frame to stdout every second; N = total lines per frame, 0 = off (default: 0)<br/>(env: LLAMA_ARG_PRINTUI) |
+| `--tui` | interactive ncurses terminal dashboard (box-drawing, mouse/keyboard, live tokens); requires a TTY, cannot be combined with `--printui` (default: off)<br/>(env: LLAMA_ARG_TUI) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |

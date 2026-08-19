@@ -255,6 +255,7 @@ static inline std::string stop_type_to_str(stop_type type) {
         case STOP_TYPE_EOS:   return "eos";
         case STOP_TYPE_WORD:  return "word";
         case STOP_TYPE_LIMIT: return "limit";
+        case STOP_TYPE_ABORT: return "abort";
         default:              return "none";
     }
 }
@@ -382,7 +383,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         };
     }
     json finish_reason = "length";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_ABORT) {
         finish_reason = "stop";
     }
     json res = json {
@@ -422,7 +423,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         msg.role = "assistant";
         msg.content = content;
     }
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_ABORT) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
@@ -464,7 +465,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::time_t t = std::time(0);
     std::string finish_reason = "length";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_ABORT) {
         finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
@@ -732,7 +733,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
 
 json server_task_result_cmpl_final::to_json_anthropic() {
     std::string stop_reason = "max_tokens";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_ABORT) {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 
@@ -800,7 +801,7 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
     json events = json::array();
 
     std::string stop_reason = "max_tokens";
-    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS || stop == STOP_TYPE_ABORT) {
         stop_reason = oaicompat_msg.tool_calls.empty() ? "end_turn" : "tool_use";
     }
 
